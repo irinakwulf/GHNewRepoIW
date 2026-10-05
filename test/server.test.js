@@ -56,7 +56,12 @@ const NOT_FOUND = 'Not found.';
 const METHOD_NOT_ALLOWED = 'Method not allowed.';
 const SERVER_ERROR = 'Something went wrong.';
 
-/** Upper bound on any single client exchange, so a stalled response fails instead of hanging. */
+/**
+ * Inactivity timeout armed on every client socket the helpers open: a connection that sends or
+ * receives nothing for 5 seconds is destroyed and its exchange rejects, so a stall fails instead
+ * of hanging. Traffic resets it, so it does not cap an exchange's total duration; the 10-second
+ * per-test timeout bounds that instead.
+ */
 const IO_TIMEOUT_MS = 5000;
 
 /** Options for each test that spawns the real entry point: a bound on the whole test. */
@@ -356,6 +361,125 @@ function assertRawText(res, statusLine, body, label) {
 }
 
 /**
+ * Writes two pieces of raw request text on one persistent `node:net` connection: `first` on
+ * connect, and `second` only once a complete response to `first` has arrived. That response is
+ * framed in bytes by its `content-length`; everything after it, until the server closes the
+ * connection, is the second response.
+ *
+ * T9 uses it for a POST whose body is still arriving. `http.request` with `agent: false` asks the
+ * server to close the connection after its response, so it cannot show what becomes of the rest of
+ * the body; a keep-alive connection can. When `first` holds the head and only part of the body, a
+ * complete response to it shows the server answered without waiting for the body. When `second`
+ * holds the rest of the body and then a request with `Connection: close`, an exact response to that
+ * request shows the server discarded the body and kept the connection in step.
+ *
+ * It rejects on a head without its terminating blank line, a first response without exactly one
+ * decimal `content-length`, a connection that closes before a response is complete, a transport
+ * error, or a 5-second idle timeout. A cleanup step of the test destroys the socket, which does
+ * nothing once it has closed, so a test that fails or times out mid-exchange cannot leave it open.
+ *
+ * @param {import('node:test').TestContext} t The running test, which owns the connection.
+ * @param {number} port Port to connect to on 127.0.0.1.
+ * @param {string} first Raw text written on connect.
+ * @param {string} second Raw text written once the response to `first` is complete. Its last
+ *   request must ask the server to close the connection, which ends the exchange.
+ * @returns {Promise<{ first: object, second: object }>} Each response as
+ *   `{ statusLine, status, headers, body }`, with lower-cased headers and the body decoded as
+ *   UTF-8.
+ */
+function keepAliveExchange(t, port, first, second) {
+  return new Promise((resolve, reject) => {
+    // Bytes not yet assigned to a response: the first response, then whatever follows it.
+    let received = Buffer.alloc(0);
+    let firstResponse = null;
+
+    // Parses the head that ends at byte `headEnd` of `received`, which excludes the blank line.
+    function parseHead(headEnd) {
+      const head = received.subarray(0, headEnd).toString('utf8');
+      const [statusLine, ...headerLines] = head.split('\r\n');
+      const headers = {};
+      for (const line of headerLines) {
+        const colon = line.indexOf(':');
+        if (colon === -1) {
+          throw new Error(`Malformed header line in raw response: ${JSON.stringify(line)}`);
+        }
+        const name = line.slice(0, colon).trim().toLowerCase();
+        // The first response is framed by this field, so a second copy would make it ambiguous.
+        if (name === 'content-length' && name in headers) {
+          throw new Error('Raw response repeats content-length');
+        }
+        headers[name] = line.slice(colon + 1).trim();
+      }
+      return { statusLine, status: Number(statusLine.split(' ')[1]), headers };
+    }
+
+    const socket = net.connect(port, HOST, () => socket.write(first));
+    onCleanup(t, () => {
+      socket.destroy();
+    });
+    socket.setTimeout(IO_TIMEOUT_MS, () => {
+      const awaited = firstResponse === null ? 'first' : 'second';
+      socket.destroy(new Error(`keep-alive exchange timed out awaiting the ${awaited} response`));
+    });
+    socket.on('data', (chunk) => {
+      received = Buffer.concat([received, chunk]);
+      if (firstResponse !== null) {
+        return;
+      }
+      const headEnd = received.indexOf('\r\n\r\n');
+      if (headEnd === -1) {
+        return;
+      }
+      try {
+        const head = parseHead(headEnd);
+        const declared = head.headers['content-length'];
+        if (declared === undefined || !/^\d+$/.test(declared)) {
+          throw new Error(
+            `First raw response has no usable content-length: ${JSON.stringify(declared)}`,
+          );
+        }
+        const bodyEnd = headEnd + 4 + Number(declared);
+        if (received.length < bodyEnd) {
+          return;
+        }
+        const body = received.subarray(headEnd + 4, bodyEnd).toString('utf8');
+        firstResponse = { ...head, body };
+        received = received.subarray(bodyEnd);
+        // Sent only now, so `second` reaches the server strictly after the first response is out.
+        socket.write(second);
+      } catch (err) {
+        socket.destroy(err);
+      }
+    });
+    socket.on('error', reject);
+    // After an error the promise is already rejected, and this later settle attempt is ignored.
+    socket.on('close', () => {
+      const text = JSON.stringify(received.toString('utf8'));
+      if (firstResponse === null) {
+        reject(new Error(`connection closed before the first response was complete: ${text}`));
+        return;
+      }
+      const headEnd = received.indexOf('\r\n\r\n');
+      if (headEnd === -1) {
+        reject(
+          new Error(
+            'connection closed before a second response was complete, after ' +
+              `${JSON.stringify(firstResponse.statusLine)}: ${text}`,
+          ),
+        );
+        return;
+      }
+      try {
+        const body = received.subarray(headEnd + 4).toString('utf8');
+        resolve({ first: firstResponse, second: { ...parseHead(headEnd), body } });
+      } catch (err) {
+        reject(err);
+      }
+    });
+  });
+}
+
+/**
  * Runs the real entry point, `node src/server.js`, as a child process with `env` merged over the
  * current environment. No shell is involved (`shell` defaults to `false`).
  *
@@ -502,6 +626,82 @@ function callArguments(mockFn) {
   return mockFn.mock.calls.map((call) => call.arguments);
 }
 
+/**
+ * Sends GET requests one after another over one persistent connection and collects each response
+ * together with the socket that carried it.
+ *
+ * `request` gives every exchange its own connection, so it cannot show that a connection survives a
+ * response. This helper owns a keep-alive agent limited to one socket and sends each request only
+ * after the previous one has closed. For a kept-alive response that means its socket is back in the
+ * agent's pool, so the next request reuses it; if the server closed or destroyed the connection,
+ * the next request gets a new socket or fails. Each result records the carrying socket and
+ * `reusedSocket`, so a test can assert continuity. The agent is destroyed by a cleanup step
+ * registered before the first request, which closes the pooled socket, so nothing pooled outlives
+ * the test. Each request also registers its own destroy, and the 5-second socket timeout fails a
+ * stalled exchange instead of hanging.
+ *
+ * @param {import('node:test').TestContext} t The running test, which owns the agent and its socket.
+ * @param {number} port Port to connect to on 127.0.0.1.
+ * @param {string[]} targets Request targets, each sent as a GET, in order.
+ * @returns {Promise<Array<{
+ *   status: number,
+ *   headers: object,
+ *   body: string,
+ *   socket: import('node:net').Socket,
+ *   reusedSocket: boolean,
+ * }>>} One result per target: what `request` returns, plus the socket that carried the response
+ *   and whether the agent reused it from an earlier exchange.
+ */
+async function keepAliveRequests(t, port, targets) {
+  const agent = new http.Agent({ keepAlive: true, maxSockets: 1 });
+  onCleanup(t, () => {
+    agent.destroy();
+  });
+  const results = [];
+  for (const target of targets) {
+    const result = await new Promise((resolve, reject) => {
+      let response = null;
+      const req = http.request(
+        { host: HOST, port, path: target, agent, timeout: IO_TIMEOUT_MS },
+        (res) => {
+          // Read while the response is live: a kept-alive socket is detached from it once it ends.
+          const { socket } = res;
+          const chunks = [];
+          res.on('data', (chunk) => chunks.push(chunk));
+          res.on('error', reject);
+          res.on('end', () => {
+            response = {
+              status: res.statusCode,
+              headers: res.headers,
+              body: Buffer.concat(chunks).toString('utf8'),
+              socket,
+              reusedSocket: req.reusedSocket,
+            };
+          });
+        },
+      );
+      onCleanup(t, () => {
+        req.destroy();
+      });
+      req.on('timeout', () => req.destroy(new Error(`request for ${target} timed out`)));
+      req.on('error', reject);
+      // 'close' follows the response's 'end' once the socket is released, back to the pool or
+      // closed; earlier, it means the connection ended mid-exchange. After an error the promise is
+      // already rejected, and this later settle attempt is ignored.
+      req.on('close', () => {
+        if (response === null) {
+          reject(new Error(`connection closed before the response for ${target} ended`));
+        } else {
+          resolve(response);
+        }
+      });
+      req.end();
+    });
+    results.push(result);
+  }
+  return results;
+}
+
 // ---------------------------------------------------------------------------------------------
 // Interface rows: greeting, trimming, fallback, length boundary, routes and methods (T1 to T12)
 // ---------------------------------------------------------------------------------------------
@@ -515,10 +715,21 @@ test('T1: GET / returns 200 Hello, world! as plain text with no trailing newline
   assert.strictEqual(res.headers['content-length'], '13');
 });
 
-test('T2: GET /?name=Ada greets Ada', IN_PROCESS_TEST, async (t) => {
+test('T2: GET /?name=Ada greets Ada, and later requests without a name on the same server get Hello, world!', IN_PROCESS_TEST, async (t) => {
   const port = await startServer(t);
+  // The order matters: all five requests go to one server, and each request without a name comes
+  // after a name was greeted, so a server that remembered the previous name would answer with it.
+  const cases = [
+    ['/?name=Ada', 'Hello, Ada!'],
+    ['/', HELLO_WORLD],
+    ['/?name=', HELLO_WORLD],
+    ['/?name=Bob', 'Hello, Bob!'],
+    ['/', HELLO_WORLD],
+  ];
 
-  assertText(await request(t, port, { path: '/?name=Ada' }), 200, 'Hello, Ada!');
+  for (const [target, body] of cases) {
+    assertText(await request(t, port, { path: target }), 200, body, target);
+  }
   assert.deepStrictEqual(greet('Ada'), { statusCode: 200, body: 'Hello, Ada!' });
 });
 
@@ -700,7 +911,7 @@ test('T8: any path other than / returns 404 Not found. for every method, includi
   assertHead(head, 404, '10', 'HEAD /about');
 });
 
-test('T9: any method other than GET on / returns 405 Method not allowed. with Allow: GET', IN_PROCESS_TEST, async (t) => {
+test('T9: any method other than GET on / returns 405 Method not allowed. with Allow: GET, promptly even while a request body is still arriving', IN_PROCESS_TEST, async (t) => {
   const port = await startServer(t);
   const requests = [
     { method: 'POST', path: '/' },
@@ -725,6 +936,33 @@ test('T9: any method other than GET on / returns 405 Method not allowed. with Al
   const head = await request(t, port, { method: 'HEAD', path: '/' });
   assertHead(head, 405, '19', 'HEAD /');
   assert.strictEqual(head.headers.allow, 'GET', 'HEAD /');
+
+  // A request body never holds up the reply. Only part of the declared body is sent before the 405
+  // must arrive. The rest follows on the same connection, then a GET, which is answered correctly
+  // only if the server consumed exactly the declared body and kept the connection in step.
+  const bodyStart = 'the first part of a request body';
+  const bodyRest = ', then the rest of it.';
+  const contentLength = Buffer.byteLength(bodyStart + bodyRest);
+  const { first, second } = await keepAliveExchange(
+    t,
+    port,
+    `POST / HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Length: ${contentLength}\r\n\r\n${bodyStart}`,
+    `${bodyRest}GET / HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n`,
+  );
+
+  const post = 'POST / while its body is still arriving';
+  assert.strictEqual(first.statusLine, 'HTTP/1.1 405 Method Not Allowed', post);
+  assertText(first, 405, METHOD_NOT_ALLOWED, post);
+  assert.strictEqual(first.headers.allow, 'GET', post);
+  assert.strictEqual(first.headers['content-length'], '19', post);
+  // The server offers to reuse the connection, so it must read past the rest of the body.
+  assert.strictEqual(first.headers.connection, 'keep-alive', post);
+
+  const reused = 'GET / after the rest of the body, on the same connection';
+  assert.strictEqual(second.statusLine, 'HTTP/1.1 200 OK', reused);
+  assertText(second, 200, HELLO_WORLD, reused);
+
+  assertText(await request(t, port, { path: '/' }), 200, HELLO_WORLD, 'GET / on a new connection');
 });
 
 test('T10: a name containing HTML is echoed unescaped as plain text with nosniff', IN_PROCESS_TEST, async (t) => {
@@ -812,6 +1050,167 @@ test('T13: an unexpected error returns 500, logs no request data, and the server
     .join('\n');
   assert.doesNotMatch(logged, /zelda7f3k/i);
   assert.doesNotMatch(logged, /\?name=/);
+
+  // The thrown values the payload above leaves untried. Each is selected by a requested name that
+  // carries the same token, and builds every name, class name, message and code it has from that
+  // name, so a diagnostic that read any of them would fail the privacy checks. The label is the
+  // literal the service must print for it.
+  const variantMessage = (rawName) => `could not greet ${rawName} at /?name=${rawName}`;
+  // A subclass of a built-in error class, named after the requested name, with that name as its
+  // `name` too. AggregateError takes its inner errors before the message.
+  const subclassError = (BuiltIn, rawName) => {
+    const Subclass = { [rawName]: class extends BuiltIn {} }[rawName];
+    const err =
+      BuiltIn === AggregateError
+        ? new Subclass([new Error(rawName)], variantMessage(rawName))
+        : new Subclass(variantMessage(rawName));
+    err.name = rawName;
+    return err;
+  };
+  const builtInClasses = [
+    [AggregateError, 'AggregateError'],
+    [EvalError, 'EvalError'],
+    [RangeError, 'RangeError'],
+    [ReferenceError, 'ReferenceError'],
+    [SyntaxError, 'SyntaxError'],
+    [TypeError, 'TypeError'],
+    [URIError, 'URIError'],
+  ];
+  const variants = [
+    {
+      name: 'Zelda7f3kNamed',
+      label: 'Error',
+      build: (rawName) => {
+        const err = new Error(variantMessage(rawName));
+        err.name = rawName;
+        return err;
+      },
+    },
+    ...builtInClasses.map(([BuiltIn, label]) => ({
+      name: `Zelda7f3k${label}`,
+      label,
+      build: (rawName) => subclassError(BuiltIn, rawName),
+    })),
+    // An allowlisted code follows the class label, printed as the allowlist's own string.
+    {
+      name: 'Zelda7f3kAllowlistedCode',
+      label: 'RangeError [ERR_HTTP_INVALID_STATUS_CODE]',
+      build: (rawName) => {
+        const err = subclassError(RangeError, rawName);
+        err.code = 'ERR_HTTP_INVALID_STATUS_CODE';
+        return err;
+      },
+    },
+    // Only strict equality selects a code: one that merely contains an allowlisted code, or a
+    // boxed string equal to one, is left out.
+    {
+      name: 'Zelda7f3kPrefixedCode',
+      label: 'TypeError',
+      build: (rawName) => {
+        const err = subclassError(TypeError, rawName);
+        err.code = `ECONNRESET_${rawName.toUpperCase()}`;
+        return err;
+      },
+    },
+    {
+      name: 'Zelda7f3kBoxedCode',
+      label: 'Error',
+      build: (rawName) => {
+        const err = new Error(variantMessage(rawName));
+        err.name = rawName;
+        err.code = new String('EPIPE');
+        return err;
+      },
+    },
+    // A value that is not an error gets the fixed fallback, whatever it contains.
+    {
+      name: 'Zelda7f3kString',
+      label: 'non-Error value thrown',
+      build: (rawName) => variantMessage(rawName),
+    },
+    {
+      name: 'Zelda7f3kObject',
+      label: 'non-Error value thrown',
+      build: (rawName) => ({ name: rawName, message: variantMessage(rawName), code: 'ECONNRESET' }),
+    },
+  ];
+  const variantsByName = new Map(variants.map((variant) => [variant.name, variant]));
+  // Throws the variant a requested name selects, and greets every other name as the service does.
+  const variantGreet = (rawName) => {
+    const variant = variantsByName.get(rawName);
+    if (variant === undefined) {
+      return greet(rawName);
+    }
+    throw variant.build(rawName);
+  };
+
+  // Again, the privacy checks only mean something if each payload really carries the name.
+  for (const { name } of variants) {
+    assert.throws(
+      () => variantGreet(name),
+      (thrown) => {
+        if (typeof thrown === 'string') {
+          assert.match(thrown, /Zelda7f3k/, name);
+          return true;
+        }
+        assert.strictEqual(thrown.name, name, name);
+        assert.match(thrown.message, /Zelda7f3k/, name);
+        if (thrown instanceof Error && thrown.constructor !== Error) {
+          assert.strictEqual(thrown.constructor.name, name, name);
+        }
+        return true;
+      },
+    );
+  }
+
+  // Every variant and two greetings, on one keep-alive connection: a 500 that could be written
+  // leaves the connection open for the next request.
+  log.mock.resetCalls();
+  const variantPort = await startServer(t, { greet: variantGreet });
+  const failing = ({ name }) => ({ target: `/?name=${name}`, status: 500, body: SERVER_ERROR });
+  const greeting = { target: '/?name=Ada', status: 200, body: 'Hello, Ada!' };
+  const exchanges = [failing(variants[0]), greeting, ...variants.slice(1).map(failing), greeting];
+  const responses = await keepAliveRequests(
+    t,
+    variantPort,
+    exchanges.map(({ target }) => target),
+  );
+
+  assert.strictEqual(responses.length, exchanges.length);
+  assert.strictEqual(responses[0].reusedSocket, false, 'the first request opens the connection');
+  for (const [index, { target, status, body }] of exchanges.entries()) {
+    const res = responses[index];
+    const label = `keep-alive GET ${target} (#${index + 1})`;
+    assertText(res, status, body, label);
+    if (status === 500) {
+      assert.strictEqual(res.headers['content-length'], '21', label);
+      assert.strictEqual(res.headers.connection, 'keep-alive', `${label}: connection`);
+    }
+    if (index > 0) {
+      assert.strictEqual(res.socket, responses[0].socket, `${label}: same connection`);
+      assert.strictEqual(res.reusedSocket, true, `${label}: reused connection`);
+    }
+  }
+
+  // One single-string diagnostic per 500, in order, each holding only the literal label.
+  assert.deepStrictEqual(
+    callArguments(log),
+    variants.map(({ label }) => [`${UNEXPECTED_ERROR_LOG} (stage: greeting): ${label}`]),
+  );
+  const variantLogged = callArguments(log)
+    .flat()
+    .map((value) => String(value))
+    .join('\n');
+  assert.doesNotMatch(variantLogged, /zelda7f3k/i);
+  assert.doesNotMatch(variantLogged, /\?name=/);
+
+  // The same server still serves a request on a new connection.
+  assertText(
+    await request(t, variantPort, { path: '/?name=Ada' }),
+    200,
+    'Hello, Ada!',
+    'GET /?name=Ada on a new connection',
+  );
 });
 
 test('T14: PORT selects the listening port of the real entry point', LIFECYCLE_TEST, async (t) => {
@@ -990,4 +1389,18 @@ test('T20: an unreadable error and a failing console still produce the 500, and 
   assert.deepStrictEqual(log.mock.calls[1].arguments, [expected]);
   assert.ok(log.mock.calls[1].error instanceof Error, 'the second console call threw');
   assert.strictEqual(log.mock.calls[1].error.message, 'console failed');
+
+  // The 500 for an unreadable error leaves a keep-alive connection open for the next request too.
+  const [failed, after] = await keepAliveRequests(t, port, ['/', '/about']);
+  assertText(failed, 500, SERVER_ERROR, 'keep-alive unreadable error');
+  assert.strictEqual(failed.headers['content-length'], '21', 'keep-alive unreadable error');
+  assert.strictEqual(failed.headers.connection, 'keep-alive', 'keep-alive unreadable error');
+  assertText(after, 404, NOT_FOUND, 'keep-alive GET /about after the 500');
+  assert.strictEqual(after.socket, failed.socket, 'GET /about rides the connection of the 500');
+  assert.strictEqual(after.reusedSocket, true, 'GET /about reuses the connection of the 500');
+
+  // That 500 adds exactly one diagnostic, and the console no longer throws.
+  assert.strictEqual(log.mock.callCount(), 3);
+  assert.deepStrictEqual(log.mock.calls[2].arguments, [expected]);
+  assert.strictEqual(log.mock.calls[2].error, undefined, 'the third console call returned');
 });
