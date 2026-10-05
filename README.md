@@ -119,8 +119,11 @@ npm test
 ```
 
 This runs `node --test test/server.test.js`. The tests need no network access and no installs beyond
-`npm install`. They start and stop their own servers on ports chosen at run time on `127.0.0.1`, so
-port 3000 does not need to be free, and a server already running from `npm start` does not interfere.
+`npm install`. They start and stop their own servers on ports chosen at run time and send every
+request to `127.0.0.1`, so port 3000 does not need to be free, and a server already running from
+`npm start` does not interfere. Most tests run the service in-process, listening on `127.0.0.1`
+only. The start-up tests run the real server, which listens on every network interface as
+`npm start` does, and the port-in-use test holds its port on every interface in the same way.
 
 A passing run ends with a summary reporting `tests 20`, `pass 20` and `fail 0`, and the exit status
 is 0. Each summary line starts with `ℹ` in a terminal, or `#` when the output is piped or redirected.

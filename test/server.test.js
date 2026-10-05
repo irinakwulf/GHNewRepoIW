@@ -8,10 +8,16 @@
  * lifecycle: cases T1 to T20, one top-level test each.
  *
  * Isolation and portability:
- * - Every server listens on an OS-assigned port on the 127.0.0.1 loopback, so the run needs no
- *   network, no DNS, and never needs port 3000 to be free.
+ * - Every client connection goes to 127.0.0.1 on a port chosen at run time, so the run needs no
+ *   network, no DNS, and never needs port 3000 to be free. In-process servers listen on 127.0.0.1.
+ *   The spawned entry point listens with no host, on the unspecified address, and the port holders
+ *   bind that same address, so the port-in-use collision happens on every platform.
  * - Every server, socket and child process a test opens is closed or killed in that test's own
- *   `t.after`, and every wait is bounded by a socket or test timeout, so the run exits on its own.
+ *   `t.after`. Each test has one such hook, which runs every cleanup step newest first and reports
+ *   a failure only after all steps have run, so one stuck resource cannot leave the others open.
+ *   The steps are idempotent, so a resource that already closed on completion is left as it is.
+ * - Every wait is bounded by the 5-second socket timeout, the test's own timeout or the 10-second
+ *   deadline on each cleanup step, so the run exits on its own.
  * - Child processes run `process.execPath` on an absolute path built with `path.join`, with no
  *   shell, so the suite behaves the same on macOS, Linux and Windows.
  * - Top-level tests in one file run one at a time (the `node:test` default). T17 and T19 rely on
@@ -34,7 +40,10 @@ const { createServer, greet } = require('../src/server.js');
 /** Absolute, platform-correct path of the service entry point, for the lifecycle tests. */
 const SERVER_PATH = path.join(__dirname, '..', 'src', 'server.js');
 
-/** Loopback address for every client connection; never `localhost`, so no DNS or IPv6 ordering. */
+/**
+ * Loopback address of every client connection and in-process server; never `localhost`, so no DNS
+ * or IPv6 ordering.
+ */
 const HOST = '127.0.0.1';
 
 /** Media type every application-generated response must carry. */
@@ -53,8 +62,94 @@ const IO_TIMEOUT_MS = 5000;
 /** Options for each test that spawns the real entry point: a bound on the whole test. */
 const LIFECYCLE_TEST = Object.freeze({ timeout: 10000 });
 
+/** Options for each in-process test: a bound on the whole test, set-up waits included. */
+const IN_PROCESS_TEST = Object.freeze({ timeout: 10000 });
+
+/**
+ * Deadline for each cleanup step. A test's timeout does not cover its `t.after` hook, and a
+ * server's `close()` may wait out the service's 5-second CONNECT idle timeout, so the bound is
+ * longer than that.
+ */
+const CLEANUP_TIMEOUT_MS = 10000;
+
 /** Diagnostic prefix the service logs for an exception raised while a request is handled. */
 const UNEXPECTED_ERROR_LOG = 'Unexpected error while handling a request';
+
+/** Each running test's cleanup steps, keyed by its context, in the order they were registered. */
+const cleanupSteps = new WeakMap();
+
+/**
+ * Registers a step that releases a resource the test opened. The first step registered for a test
+ * also registers that test's one `t.after` hook, which runs them all. That hook has no timeout:
+ * `node:test` skips a test's later `after` hooks once one fails and stops waiting on a hook that
+ * times out, so per-resource hooks or a hook deadline could leave steps unrun or unawaited. Each
+ * step carries its own deadline instead.
+ *
+ * @param {import('node:test').TestContext} t The running test, which owns the resource.
+ * @param {() => unknown} step Releases the resource, optionally returning a promise. It must be
+ *   idempotent, because it also runs when the resource already closed on completion.
+ */
+function onCleanup(t, step) {
+  let steps = cleanupSteps.get(t);
+  if (steps === undefined) {
+    steps = [];
+    cleanupSteps.set(t, steps);
+    t.after(() => runCleanup(steps));
+  }
+  steps.push(step);
+}
+
+/**
+ * Runs a test's cleanup steps newest first, so clients close before their server and a child is
+ * stopped before the port holder registered ahead of it. Every step runs even when an earlier one
+ * throws, rejects or misses its deadline; the failures are thrown once all steps have run, so the
+ * test still fails visibly.
+ *
+ * @param {Array<() => unknown>} steps The test's registered steps, emptied as they run.
+ * @returns {Promise<void>}
+ */
+async function runCleanup(steps) {
+  const failures = [];
+  while (steps.length > 0) {
+    const step = steps.pop();
+    try {
+      // Calling the step inside `then` turns a synchronous throw into a rejection.
+      await withCleanupDeadline(Promise.resolve().then(step));
+    } catch (err) {
+      failures.push(err);
+    }
+  }
+  if (failures.length === 1) {
+    throw failures[0];
+  }
+  if (failures.length > 1) {
+    // Reporters print an error's message, not the entries of `errors`, so the message names each.
+    const reasons = failures.map((err) => (err instanceof Error ? err.message : String(err)));
+    throw new AggregateError(
+      failures,
+      `${failures.length} cleanup steps failed: ${reasons.join('; ')}`,
+    );
+  }
+}
+
+/**
+ * Settles as `promise` does, or rejects once CLEANUP_TIMEOUT_MS pass first. The timer stays ref'd,
+ * so a step that never settles keeps the run alive until its deadline reports it, and it is cleared
+ * as soon as either side settles.
+ *
+ * @param {Promise<unknown>} promise A running cleanup step.
+ * @returns {Promise<unknown>}
+ */
+function withCleanupDeadline(promise) {
+  let timer;
+  const expired = new Promise((_resolve, reject) => {
+    timer = setTimeout(
+      () => reject(new Error(`cleanup step did not finish within ${CLEANUP_TIMEOUT_MS} ms`)),
+      CLEANUP_TIMEOUT_MS,
+    );
+  });
+  return Promise.race([promise, expired]).finally(() => clearTimeout(timer));
+}
 
 /**
  * Starts a fresh in-process server on an OS-assigned loopback port and registers its shutdown.
@@ -69,7 +164,7 @@ const UNEXPECTED_ERROR_LOG = 'Unexpected error while handling a request';
  */
 function startServer(t, options) {
   const server = createServer(options);
-  t.after(() => {
+  onCleanup(t, () => {
     server.closeAllConnections();
     return new Promise((resolve) => server.close(() => resolve()));
   });
@@ -89,15 +184,18 @@ function startServer(t, options) {
  * `agent: false` gives each request its own connection that closes after the response, so nothing
  * pooled outlives a test. The request target is sent exactly as given, so `//`, `/%2F` and
  * `/?name=%ZZ` reach the server unchanged. A transport error rejects with the original error, so a
- * caller can check its `code` (for example `ECONNRESET` for a destroyed connection).
+ * caller can check its `code` (for example `ECONNRESET` for a destroyed connection). A cleanup step
+ * of the test destroys the request, which does nothing once the exchange has finished, so a test
+ * that fails or times out mid-exchange cannot leave the connection open.
  *
- * @param {number} port Port on 127.0.0.1.
+ * @param {import('node:test').TestContext} t The running test, which owns the connection.
+ * @param {number} port Port to connect to on 127.0.0.1.
  * @param {{ method?: string, path?: string }} [options] Method (default `GET`) and request target
  *   (default `/`).
  * @returns {Promise<{ status: number, headers: object, body: string }>} The status code, the
  *   lower-cased response headers, and the body decoded as UTF-8.
  */
-function request(port, { method = 'GET', path: target = '/' } = {}) {
+function request(t, port, { method = 'GET', path: target = '/' } = {}) {
   return new Promise((resolve, reject) => {
     const req = http.request(
       { host: HOST, port, method, path: target, agent: false, timeout: IO_TIMEOUT_MS },
@@ -114,6 +212,9 @@ function request(port, { method = 'GET', path: target = '/' } = {}) {
         });
       },
     );
+    onCleanup(t, () => {
+      req.destroy();
+    });
     req.on('timeout', () => req.destroy(new Error('request timed out')));
     req.on('error', reject);
     req.end();
@@ -199,16 +300,22 @@ function parseRawResponse(text) {
  * Used for CONNECT, whose response `http.request` would deliver through its own `connect` event,
  * and for unrecognised method tokens, which `http.request` would upper-case or refuse to send.
  * When the server ends its side, this client ends its side too (the `net` default), so the server
- * socket closes promptly. A 5-second idle timeout destroys a stalled connection and rejects.
+ * socket closes promptly. A 5-second idle timeout destroys a stalled connection and rejects. A
+ * cleanup step of the test destroys the socket, which does nothing once it has closed, so a test
+ * that fails or times out mid-exchange cannot leave it open.
  *
- * @param {number} port Port on 127.0.0.1.
+ * @param {import('node:test').TestContext} t The running test, which owns the connection.
+ * @param {number} port Port to connect to on 127.0.0.1.
  * @param {string} text The complete raw request, including the blank line that ends the head.
  * @returns {Promise<{ statusLine: string, headers: object, body: string }>}
  */
-function rawRequest(port, text) {
+function rawRequest(t, port, text) {
   return new Promise((resolve, reject) => {
     const chunks = [];
     const socket = net.connect(port, HOST, () => socket.write(text));
+    onCleanup(t, () => {
+      socket.destroy();
+    });
     socket.setTimeout(IO_TIMEOUT_MS, () => socket.destroy(new Error('raw request timed out')));
     socket.on('data', (chunk) => chunks.push(chunk));
     socket.on('error', reject);
@@ -288,7 +395,7 @@ function spawnServer(env) {
   });
   // Marks the promise as handled, so a spawn failure surfaces where it is awaited (the test or its
   // cleanup) rather than as an unhandled rejection.
-  closed.catch(() => {});
+  closed.catch(() => undefined);
 
   function waitForStdout(text) {
     return new Promise((resolve, reject) => {
@@ -336,11 +443,12 @@ function spawnServer(env) {
 }
 
 /**
- * Ensures a spawned child does not outlive its test: kills it if it is still running, then waits
- * for it to close. On Windows `kill()` always terminates forcefully, which is fine here.
+ * Ensures a spawned child does not outlive its test: a cleanup step kills it if it is still
+ * running, then waits for it to close. On Windows `kill()` always terminates forcefully, which is
+ * fine here.
  */
 function stopChildAfter(t, spawned) {
-  t.after(async () => {
+  onCleanup(t, async () => {
     const { child } = spawned;
     if (child.exitCode === null && child.signalCode === null) {
       child.kill();
@@ -351,13 +459,17 @@ function stopChildAfter(t, spawned) {
 
 /**
  * Listens on an OS-assigned port with no host, which binds the same unspecified address the service
- * binds, so a service started on that port collides with it on every platform.
+ * binds, so a service started on that port collides with it on every platform. The close is
+ * registered as a cleanup step before listening, so the test owns the holder even if listening
+ * fails; closing a holder that has already stopped is harmless.
  *
+ * @param {import('node:test').TestContext} t The running test, which owns the holder.
  * @returns {Promise<import('node:net').Server>}
  */
-function holdPort() {
+function holdPort(t) {
   return new Promise((resolve, reject) => {
     const holder = net.createServer();
+    onCleanup(t, () => closeServer(holder));
     holder.once('error', reject);
     holder.listen(0, () => {
       holder.removeListener('error', reject);
@@ -375,10 +487,11 @@ function closeServer(server) {
  * Finds a port that is free at the moment of the call. Another process could take it before the
  * child binds it; that would fail the test clearly, never hang it, and never involves port 3000.
  *
+ * @param {import('node:test').TestContext} t The running test, which owns the temporary holder.
  * @returns {Promise<number>}
  */
-async function findFreePort() {
-  const holder = await holdPort();
+async function findFreePort(t) {
+  const holder = await holdPort(t);
   const { port } = holder.address();
   await closeServer(holder);
   return port;
@@ -393,23 +506,23 @@ function callArguments(mockFn) {
 // Interface rows: greeting, trimming, fallback, length boundary, routes and methods (T1 to T12)
 // ---------------------------------------------------------------------------------------------
 
-test('T1: GET / returns 200 Hello, world! as plain text with no trailing newline', async (t) => {
+test('T1: GET / returns 200 Hello, world! as plain text with no trailing newline', IN_PROCESS_TEST, async (t) => {
   const port = await startServer(t);
 
-  const res = await request(port, { path: '/' });
+  const res = await request(t, port, { path: '/' });
 
   assertText(res, 200, HELLO_WORLD);
   assert.strictEqual(res.headers['content-length'], '13');
 });
 
-test('T2: GET /?name=Ada greets Ada', async (t) => {
+test('T2: GET /?name=Ada greets Ada', IN_PROCESS_TEST, async (t) => {
   const port = await startServer(t);
 
-  assertText(await request(port, { path: '/?name=Ada' }), 200, 'Hello, Ada!');
+  assertText(await request(t, port, { path: '/?name=Ada' }), 200, 'Hello, Ada!');
   assert.deepStrictEqual(greet('Ada'), { statusCode: 200, body: 'Hello, Ada!' });
 });
 
-test('T3: surrounding whitespace in the name is trimmed and interior spaces are kept', async (t) => {
+test('T3: surrounding whitespace in the name is trimmed and interior spaces are kept', IN_PROCESS_TEST, async (t) => {
   const port = await startServer(t);
   const cases = [
     ['/?name=%20Ada%20', 'Hello, Ada!'],
@@ -419,60 +532,60 @@ test('T3: surrounding whitespace in the name is trimmed and interior spaces are 
   ];
 
   for (const [target, body] of cases) {
-    assertText(await request(port, { path: target }), 200, body, target);
+    assertText(await request(t, port, { path: target }), 200, body, target);
   }
 });
 
-test('T4: GET /?name= that is empty, only spaces, absent or differently cased falls back to Hello, world!', async (t) => {
+test('T4: GET /?name= that is empty, only spaces, absent or differently cased falls back to Hello, world!', IN_PROCESS_TEST, async (t) => {
   const port = await startServer(t);
   const targets = ['/?name=', '/?name=%20%20%20', '/?name', '/?', '/?Name=Ada'];
 
   for (const target of targets) {
-    assertText(await request(port, { path: target }), 200, HELLO_WORLD, target);
+    assertText(await request(t, port, { path: target }), 200, HELLO_WORLD, target);
   }
   assert.deepStrictEqual(greet(null), { statusCode: 200, body: HELLO_WORLD });
   assert.deepStrictEqual(greet('   '), { statusCode: 200, body: HELLO_WORLD });
 });
 
-test('T5: a name of exactly 50 characters, with or without surrounding spaces, is greeted', async (t) => {
+test('T5: a name of exactly 50 characters, with or without surrounding spaces, is greeted', IN_PROCESS_TEST, async (t) => {
   const port = await startServer(t);
   const name = 'a'.repeat(50);
   const targets = [`/?name=${name}`, `/?name=%20${name}%20`];
 
   for (const target of targets) {
-    assertText(await request(port, { path: target }), 200, `Hello, ${name}!`, target);
+    assertText(await request(t, port, { path: target }), 200, `Hello, ${name}!`, target);
   }
 });
 
-test('T6: a name of 51 characters, with or without surrounding spaces, is rejected with 400', async (t) => {
+test('T6: a name of 51 characters, with or without surrounding spaces, is rejected with 400', IN_PROCESS_TEST, async (t) => {
   const port = await startServer(t);
   const name = 'a'.repeat(51);
   const targets = [`/?name=${name}`, `/?name=%20${name}%20`];
 
   for (const target of targets) {
-    const res = await request(port, { path: target });
+    const res = await request(t, port, { path: target });
     assertText(res, 400, NAME_TOO_LONG, target);
     assert.strictEqual(res.headers['content-length'], '36', target);
   }
   assert.deepStrictEqual(greet(name), { statusCode: 400, body: NAME_TOO_LONG });
 });
 
-test('T7: the 50-character limit counts code points, so 50 emoji are greeted and 51 are rejected', async (t) => {
+test('T7: the 50-character limit counts code points, so 50 emoji are greeted and 51 are rejected', IN_PROCESS_TEST, async (t) => {
   const port = await startServer(t);
   const fifty = '\u{1F600}'.repeat(50);
   const fiftyOne = '\u{1F600}'.repeat(51);
   // 50 emoji are 100 UTF-16 units, so a limit counted with `String.length` would reject them.
   assert.strictEqual(fifty.length, 100);
 
-  const accepted = await request(port, { path: `/?name=${encodeURIComponent(fifty)}` });
+  const accepted = await request(t, port, { path: `/?name=${encodeURIComponent(fifty)}` });
   assertText(accepted, 200, `Hello, ${fifty}!`, '50 emoji');
   assert.strictEqual(accepted.headers['content-length'], '208', '50 emoji');
 
-  const rejected = await request(port, { path: `/?name=${encodeURIComponent(fiftyOne)}` });
+  const rejected = await request(t, port, { path: `/?name=${encodeURIComponent(fiftyOne)}` });
   assertText(rejected, 400, NAME_TOO_LONG, '51 emoji');
 });
 
-test('T8: any path other than / returns 404 Not found. for every method, including HEAD', async (t) => {
+test('T8: any path other than / returns 404 Not found. for every method, including HEAD', IN_PROCESS_TEST, async (t) => {
   const port = await startServer(t);
   const requests = [
     { method: 'GET', path: '/about' },
@@ -486,16 +599,16 @@ test('T8: any path other than / returns 404 Not found. for every method, includi
 
   for (const options of requests) {
     const label = `${options.method} ${options.path}`;
-    const res = await request(port, options);
+    const res = await request(t, port, options);
     assertText(res, 404, NOT_FOUND, label);
     assert.strictEqual(res.headers['content-length'], '10', label);
   }
 
-  const head = await request(port, { method: 'HEAD', path: '/about' });
+  const head = await request(t, port, { method: 'HEAD', path: '/about' });
   assertHead(head, 404, '10', 'HEAD /about');
 });
 
-test('T9: any method other than GET on / returns 405 Method not allowed. with Allow: GET', async (t) => {
+test('T9: any method other than GET on / returns 405 Method not allowed. with Allow: GET', IN_PROCESS_TEST, async (t) => {
   const port = await startServer(t);
   const requests = [
     { method: 'POST', path: '/' },
@@ -510,43 +623,43 @@ test('T9: any method other than GET on / returns 405 Method not allowed. with Al
 
   for (const options of requests) {
     const label = `${options.method} ${options.path}`;
-    const res = await request(port, options);
+    const res = await request(t, port, options);
     assertText(res, 405, METHOD_NOT_ALLOWED, label);
     assert.strictEqual(res.headers.allow, 'GET', label);
     assert.strictEqual(res.headers['content-length'], '19', label);
   }
 
   // HEAD declares the length of the 405 body it selects and transfers none; never `0`.
-  const head = await request(port, { method: 'HEAD', path: '/' });
+  const head = await request(t, port, { method: 'HEAD', path: '/' });
   assertHead(head, 405, '19', 'HEAD /');
   assert.strictEqual(head.headers.allow, 'GET', 'HEAD /');
 });
 
-test('T10: a name containing HTML is echoed unescaped as plain text with nosniff', async (t) => {
+test('T10: a name containing HTML is echoed unescaped as plain text with nosniff', IN_PROCESS_TEST, async (t) => {
   const port = await startServer(t);
 
-  const res = await request(port, { path: '/?name=%3Cb%3EAda%3C%2Fb%3E' });
+  const res = await request(t, port, { path: '/?name=%3Cb%3EAda%3C%2Fb%3E' });
 
   assertText(res, 200, 'Hello, <b>Ada</b>!');
 });
 
-test('T11: with repeated name parameters the first is used and other parameters are ignored', async (t) => {
+test('T11: with repeated name parameters the first is used and other parameters are ignored', IN_PROCESS_TEST, async (t) => {
   const port = await startServer(t);
 
-  assertText(await request(port, { path: '/?name=Ada&name=Bob&lang=fr' }), 200, 'Hello, Ada!');
+  assertText(await request(t, port, { path: '/?name=Ada&name=Bob&lang=fr' }), 200, 'Hello, Ada!');
 });
 
-test('T12: names are decoded as UTF-8, leniently, with a byte-accurate content-length', async (t) => {
+test('T12: names are decoded as UTF-8, leniently, with a byte-accurate content-length', IN_PROCESS_TEST, async (t) => {
   const port = await startServer(t);
 
-  const zoe = await request(port, { path: '/?name=Zo%C3%AB' });
+  const zoe = await request(t, port, { path: '/?name=Zo%C3%AB' });
   assertText(zoe, 200, 'Hello, Zo\u00EB!', 'Zo%C3%AB');
   // 11 characters but 12 bytes: the length is counted in bytes.
   assert.strictEqual(zoe.headers['content-length'], '12', 'Zo%C3%AB');
 
-  assertText(await request(port, { path: '/?name=%ZZ' }), 200, 'Hello, %ZZ!', '%ZZ');
+  assertText(await request(t, port, { path: '/?name=%ZZ' }), 200, 'Hello, %ZZ!', '%ZZ');
 
-  const invalid = await request(port, { path: '/?name=%FF' });
+  const invalid = await request(t, port, { path: '/?name=%FF' });
   assertText(invalid, 200, 'Hello, \uFFFD!', '%FF');
   assert.strictEqual(invalid.headers['content-length'], '11', '%FF');
 });
@@ -556,7 +669,7 @@ test('T12: names are decoded as UTF-8, leniently, with a byte-accurate content-l
 // Error boundary, start-up lifecycle, CONNECT and the parser boundary (T13 to T20)
 // ---------------------------------------------------------------------------------------------
 
-test('T13: an unexpected error returns 500, logs no request data, and the server keeps serving', async (t) => {
+test('T13: an unexpected error returns 500, logs no request data, and the server keeps serving', IN_PROCESS_TEST, async (t) => {
   // Throws an error whose message, code and stack frame are all built from the requested name, so
   // logging any of them would reveal who was greeted.
   const leakyGreet = (rawName) => {
@@ -584,13 +697,13 @@ test('T13: an unexpected error returns 500, logs no request data, and the server
   const log = t.mock.method(console, 'error', () => {});
   const port = await startServer(t, { greet: leakyGreet });
 
-  const first = await request(port, { path: '/?name=Zelda7f3k' });
+  const first = await request(t, port, { path: '/?name=Zelda7f3k' });
   assertText(first, 500, SERVER_ERROR, 'first GET /?name=Zelda7f3k');
   assert.strictEqual(first.headers['content-length'], '21');
 
-  assertText(await request(port, { path: '/about' }), 404, NOT_FOUND, 'GET /about after a 500');
+  assertText(await request(t, port, { path: '/about' }), 404, NOT_FOUND, 'GET /about after a 500');
   assertText(
-    await request(port, { path: '/?name=Zelda7f3k' }),
+    await request(t, port, { path: '/?name=Zelda7f3k' }),
     500,
     SERVER_ERROR,
     'second GET /?name=Zelda7f3k',
@@ -610,7 +723,7 @@ test('T13: an unexpected error returns 500, logs no request data, and the server
 });
 
 test('T14: PORT selects the listening port of the real entry point', LIFECYCLE_TEST, async (t) => {
-  const port = await findFreePort();
+  const port = await findFreePort(t);
   const spawned = spawnServer({ PORT: String(port) });
   stopChildAfter(t, spawned);
 
@@ -619,12 +732,11 @@ test('T14: PORT selects the listening port of the real entry point', LIFECYCLE_T
   assert.strictEqual(spawned.stdout, `${line}\n`);
 
   // The service binds the unspecified address, so the IPv4 loopback reaches it.
-  assertText(await request(port, { path: '/' }), 200, HELLO_WORLD);
+  assertText(await request(t, port, { path: '/' }), 200, HELLO_WORLD);
 });
 
 test('T15: a port already in use prints a message naming the port and exits with code 1', LIFECYCLE_TEST, async (t) => {
-  const holder = await holdPort();
-  t.after(() => closeServer(holder));
+  const holder = await holdPort(t);
   const { port } = holder.address();
 
   const spawned = spawnServer({ PORT: String(port) });
@@ -657,16 +769,17 @@ test('T16: an invalid PORT prints an error and exits with code 1 without listeni
   }
 });
 
-test('T17: CONNECT gets a raw 405 on / and 404 elsewhere, and a raw 500 when answering fails', async (t) => {
+test('T17: CONNECT gets a raw 405 on / and 404 elsewhere, and a raw 500 when answering fails', IN_PROCESS_TEST, async (t) => {
   const port = await startServer(t);
 
-  const onRoot = await rawRequest(port, 'CONNECT / HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n');
+  const onRoot = await rawRequest(t, port, 'CONNECT / HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n');
   assertRawText(onRoot, 'HTTP/1.1 405 Method Not Allowed', METHOD_NOT_ALLOWED, 'CONNECT /');
   assert.strictEqual(onRoot.headers.allow, 'GET', 'CONNECT /');
   assert.strictEqual(onRoot.headers['content-length'], '19', 'CONNECT /');
 
   // Any other target is an unknown path: 404 takes precedence over 405, as for other methods.
   const elsewhere = await rawRequest(
+    t,
     port,
     'CONNECT example.com:443 HTTP/1.1\r\nHost: example.com:443\r\n\r\n',
   );
@@ -680,7 +793,7 @@ test('T17: CONNECT gets a raw 405 on / and 404 elsewhere, and a raw 500 when ans
   const original = Object.getOwnPropertyDescriptor(http.STATUS_CODES, '405');
   assert.strictEqual(original.value, 'Method Not Allowed');
   const restore = () => Object.defineProperty(http.STATUS_CODES, '405', original);
-  t.after(restore);
+  onCleanup(t, restore);
 
   const log = t.mock.method(console, 'error', () => {});
   Object.defineProperty(http.STATUS_CODES, '405', {
@@ -692,7 +805,7 @@ test('T17: CONNECT gets a raw 405 on / and 404 elsewhere, and a raw 500 when ans
   });
   let failed;
   try {
-    failed = await rawRequest(port, 'CONNECT / HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n');
+    failed = await rawRequest(t, port, 'CONNECT / HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n');
   } finally {
     restore();
   }
@@ -703,24 +816,24 @@ test('T17: CONNECT gets a raw 405 on / and 404 elsewhere, and a raw 500 when ans
   assert.deepStrictEqual(callArguments(log), [[`${UNEXPECTED_ERROR_LOG} (stage: connect): Error`]]);
 
   // The same server keeps serving ordinary requests.
-  assertText(await request(port, { path: '/' }), 200, HELLO_WORLD, 'GET / after CONNECT');
+  assertText(await request(t, port, { path: '/' }), 200, HELLO_WORLD, 'GET / after CONNECT');
 });
 
-test('T18: a method token the parser does not recognise gets Node native 400 and the server keeps serving', async (t) => {
+test('T18: a method token the parser does not recognise gets Node native 400 and the server keeps serving', IN_PROCESS_TEST, async (t) => {
   const port = await startServer(t);
 
   for (const requestLine of ['FOO / HTTP/1.1', 'get / HTTP/1.1']) {
-    const res = await rawRequest(port, `${requestLine}\r\nHost: 127.0.0.1\r\n\r\n`);
+    const res = await rawRequest(t, port, `${requestLine}\r\nHost: 127.0.0.1\r\n\r\n`);
     assert.strictEqual(res.statusLine, 'HTTP/1.1 400 Bad Request', requestLine);
     assert.strictEqual(res.headers['content-type'], undefined, requestLine);
     assert.deepStrictEqual(res.headers, { connection: 'close' }, requestLine);
     assert.strictEqual(res.body, '', requestLine);
   }
 
-  assertText(await request(port, { path: '/' }), 200, HELLO_WORLD, 'GET / after native 400s');
+  assertText(await request(t, port, { path: '/' }), 200, HELLO_WORLD, 'GET / after native 400s');
 });
 
-test('T19: when the 500 cannot be written either, the connection is destroyed and the server keeps serving', async (t) => {
+test('T19: when the 500 cannot be written either, the connection is destroyed and the server keeps serving', IN_PROCESS_TEST, async (t) => {
   const port = await startServer(t);
   const log = t.mock.method(console, 'error', () => {});
   // Only server responses use `ServerResponse.prototype.writeHead`; the test client does not.
@@ -728,7 +841,7 @@ test('T19: when the 500 cannot be written either, the connection is destroyed an
     throw new Error('write failed');
   });
 
-  await assert.rejects(request(port, { path: '/' }), (err) => {
+  await assert.rejects(request(t, port, { path: '/' }), (err) => {
     assert.strictEqual(err.code, 'ECONNRESET');
     return true;
   });
@@ -739,10 +852,15 @@ test('T19: when the 500 cannot be written either, the connection is destroyed an
   ]);
 
   writeHead.mock.restore();
-  assertText(await request(port, { path: '/' }), 200, HELLO_WORLD, 'GET / after a destroyed connection');
+  assertText(
+    await request(t, port, { path: '/' }),
+    200,
+    HELLO_WORLD,
+    'GET / after a destroyed connection',
+  );
 });
 
-test('T20: an unreadable error and a failing console still produce the 500, and the server keeps serving', async (t) => {
+test('T20: an unreadable error and a failing console still produce the 500, and the server keeps serving', IN_PROCESS_TEST, async (t) => {
   // An error whose `code` and `stack` cannot even be read.
   const unreadableGreet = () => {
     const err = new Error('greeting failed');
@@ -762,7 +880,7 @@ test('T20: an unreadable error and a failing console still produce the 500, and 
   const log = t.mock.method(console, 'error', () => {});
   const port = await startServer(t, { greet: unreadableGreet });
 
-  const first = await request(port, { path: '/' });
+  const first = await request(t, port, { path: '/' });
   assertText(first, 500, SERVER_ERROR, 'unreadable error');
   assert.strictEqual(first.headers['content-length'], '21');
   const expected = `${UNEXPECTED_ERROR_LOG} (stage: greeting): error details unavailable`;
@@ -772,9 +890,9 @@ test('T20: an unreadable error and a failing console still produce the 500, and 
   log.mock.mockImplementationOnce(() => {
     throw new Error('console failed');
   });
-  assertText(await request(port, { path: '/' }), 500, SERVER_ERROR, 'failing console');
+  assertText(await request(t, port, { path: '/' }), 500, SERVER_ERROR, 'failing console');
 
-  assertText(await request(port, { path: '/about' }), 404, NOT_FOUND, 'GET /about afterwards');
+  assertText(await request(t, port, { path: '/about' }), 404, NOT_FOUND, 'GET /about afterwards');
 
   assert.strictEqual(log.mock.callCount(), 2);
   assert.deepStrictEqual(log.mock.calls[1].arguments, [expected]);
