@@ -522,7 +522,7 @@ test('T2: GET /?name=Ada greets Ada', IN_PROCESS_TEST, async (t) => {
   assert.deepStrictEqual(greet('Ada'), { statusCode: 200, body: 'Hello, Ada!' });
 });
 
-test('T3: surrounding whitespace in the name is trimmed and interior spaces are kept', IN_PROCESS_TEST, async (t) => {
+test('T3: surrounding whitespace in the name, Unicode whitespace included, is trimmed and interior whitespace is kept', IN_PROCESS_TEST, async (t) => {
   const port = await startServer(t);
   const cases = [
     ['/?name=%20Ada%20', 'Hello, Ada!'],
@@ -534,9 +534,35 @@ test('T3: surrounding whitespace in the name is trimmed and interior spaces are 
   for (const [target, body] of cases) {
     assertText(await request(t, port, { path: target }), 200, body, target);
   }
+
+  // `String.prototype.trim()` also strips NBSP, the BOM, the other Unicode space separators and
+  // the Unicode line terminators, so a trim limited to ASCII whitespace, or one that leaves out
+  // the BOM, fails these. U+200B (zero-width space) is not whitespace to `trim()` and stays, so a
+  // trim that strips more than that set fails too. Each byte length is written out, not derived
+  // from the expected body.
+  const unicodeCases = [
+    // NBSP (U+00A0) on both sides.
+    ['/?name=%C2%A0Ada%C2%A0', 'Hello, Ada!', '11'],
+    // BOM (U+FEFF) on both sides; `URLSearchParams` keeps it, so only the trim can remove it.
+    ['/?name=%EF%BB%BFAda%EF%BB%BF', 'Hello, Ada!', '11'],
+    // Space separators U+1680, U+2000, U+200A before the name; U+202F, U+205F, U+3000 after it.
+    ['/?name=%E1%9A%80%E2%80%80%E2%80%8AAda%E2%80%AF%E2%81%9F%E3%80%80', 'Hello, Ada!', '11'],
+    // Line separator U+2028, CR and VT before the name; FF and paragraph separator U+2029 after it.
+    ['/?name=%E2%80%A8%0D%0BAda%0C%E2%80%A9', 'Hello, Ada!', '11'],
+    // An interior NBSP is kept, like an interior space.
+    ['/?name=Ada%C2%A0Lovelace', 'Hello, Ada\u00A0Lovelace!', '21'],
+    // A surrounding zero-width space is kept, because it is not whitespace.
+    ['/?name=%E2%80%8BAda%E2%80%8B', 'Hello, \u200BAda\u200B!', '17'],
+  ];
+
+  for (const [target, body, contentLength] of unicodeCases) {
+    const res = await request(t, port, { path: target });
+    assertText(res, 200, body, target);
+    assert.strictEqual(res.headers['content-length'], contentLength, target);
+  }
 });
 
-test('T4: GET /?name= that is empty, only spaces, absent or differently cased falls back to Hello, world!', IN_PROCESS_TEST, async (t) => {
+test('T4: GET /?name= that is empty, only whitespace, absent or differently cased falls back to Hello, world!', IN_PROCESS_TEST, async (t) => {
   const port = await startServer(t);
   const targets = ['/?name=', '/?name=%20%20%20', '/?name', '/?', '/?Name=Ada'];
 
@@ -545,6 +571,24 @@ test('T4: GET /?name= that is empty, only spaces, absent or differently cased fa
   }
   assert.deepStrictEqual(greet(null), { statusCode: 200, body: HELLO_WORLD });
   assert.deepStrictEqual(greet('   '), { statusCode: 200, body: HELLO_WORLD });
+
+  // A name made only of non-ASCII whitespace is just as blank, because `trim()` strips all of it.
+  // A trim limited to ASCII whitespace would greet all three, and one that keeps the BOM the first.
+  const unicodeBlankTargets = [
+    // NBSP, BOM and ideographic space (U+00A0, U+FEFF, U+3000).
+    '/?name=%C2%A0%EF%BB%BF%E3%80%80',
+    // Space separators U+1680, U+2000, U+200A, U+202F and U+205F.
+    '/?name=%E1%9A%80%E2%80%80%E2%80%8A%E2%80%AF%E2%81%9F',
+    // Line and paragraph separators (U+2028, U+2029), VT, FF and CR.
+    '/?name=%E2%80%A8%E2%80%A9%0B%0C%0D',
+  ];
+
+  for (const target of unicodeBlankTargets) {
+    const res = await request(t, port, { path: target });
+    assertText(res, 200, HELLO_WORLD, target);
+    assert.strictEqual(res.headers['content-length'], '13', target);
+  }
+  assert.deepStrictEqual(greet('\u00A0\uFEFF\u3000\u2028'), { statusCode: 200, body: HELLO_WORLD });
 });
 
 test('T5: a name of exactly 50 characters, with or without surrounding spaces, is greeted', IN_PROCESS_TEST, async (t) => {
@@ -570,7 +614,7 @@ test('T6: a name of 51 characters, with or without surrounding spaces, is reject
   assert.deepStrictEqual(greet(name), { statusCode: 400, body: NAME_TOO_LONG });
 });
 
-test('T7: the 50-character limit counts code points, so 50 emoji are greeted and 51 are rejected', IN_PROCESS_TEST, async (t) => {
+test('T7: the 50-character limit counts code points, not UTF-16 units or graphemes, with no normalisation', IN_PROCESS_TEST, async (t) => {
   const port = await startServer(t);
   const fifty = '\u{1F600}'.repeat(50);
   const fiftyOne = '\u{1F600}'.repeat(51);
@@ -583,6 +627,54 @@ test('T7: the 50-character limit counts code points, so 50 emoji are greeted and
 
   const rejected = await request(t, port, { path: `/?name=${encodeURIComponent(fiftyOne)}` });
   assertText(rejected, 400, NAME_TOO_LONG, '51 emoji');
+
+  // Man, ZWJ, woman, ZWJ, girl: one grapheme of 5 code points. Ten of them are 50 code points and
+  // are greeted; eleven are 55 and are rejected, although a limit that counted graphemes would see
+  // only 11 characters and greet them.
+  const family = '\u{1F468}\u200D\u{1F469}\u200D\u{1F467}';
+  assert.strictEqual(Array.from(family).length, 5);
+  const tenFamilies = family.repeat(10);
+  const elevenFamilies = family.repeat(11);
+
+  const families = await request(t, port, { path: `/?name=${encodeURIComponent(tenFamilies)}` });
+  assertText(families, 200, `Hello, ${tenFamilies}!`, '10 family sequences');
+  assert.strictEqual(families.headers['content-length'], '188', '10 family sequences');
+
+  const tooManyFamilies = await request(t, port, {
+    path: `/?name=${encodeURIComponent(elevenFamilies)}`,
+  });
+  assertText(tooManyFamilies, 400, NAME_TOO_LONG, '11 family sequences');
+  assert.strictEqual(tooManyFamilies.headers['content-length'], '36', '11 family sequences');
+
+  // `e` plus a combining acute accent is 2 code points, which NFC would compose into 1. Counted as
+  // sent, 25 of them are 50 code points and are greeted with the decomposed text unchanged; 26 are
+  // 52 and are rejected, although normalising before counting would see 26 and greet them.
+  const acute = 'e\u0301';
+  assert.strictEqual(Array.from(acute).length, 2);
+  const twentyFiveAcutes = acute.repeat(25);
+  const twentySixAcutes = acute.repeat(26);
+
+  const decomposed = await request(t, port, {
+    path: `/?name=${encodeURIComponent(twentyFiveAcutes)}`,
+  });
+  assertText(decomposed, 200, `Hello, ${twentyFiveAcutes}!`, '25 decomposed e-acute');
+  assert.strictEqual(decomposed.headers['content-length'], '83', '25 decomposed e-acute');
+
+  const tooManyAcutes = await request(t, port, {
+    path: `/?name=${encodeURIComponent(twentySixAcutes)}`,
+  });
+  assertText(tooManyAcutes, 400, NAME_TOO_LONG, '26 decomposed e-acute');
+  assert.strictEqual(tooManyAcutes.headers['content-length'], '36', '26 decomposed e-acute');
+
+  // The echoed name is not normalised either. NFC would return the precomposed `Zo\u00EB` in
+  // 12 bytes, the form T12 pins, and NFKC would turn the U+FB01 ligature into `fi`.
+  const combining = await request(t, port, { path: '/?name=Zoe%CC%88' });
+  assertText(combining, 200, 'Hello, Zoe\u0308!', 'Zoe%CC%88');
+  assert.strictEqual(combining.headers['content-length'], '13', 'Zoe%CC%88');
+
+  const ligature = await request(t, port, { path: '/?name=%EF%AC%81' });
+  assertText(ligature, 200, 'Hello, \uFB01!', '%EF%AC%81');
+  assert.strictEqual(ligature.headers['content-length'], '11', '%EF%AC%81');
 });
 
 test('T8: any path other than / returns 404 Not found. for every method, including HEAD', IN_PROCESS_TEST, async (t) => {
