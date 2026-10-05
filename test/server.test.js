@@ -21,7 +21,7 @@
  * - Child processes run `process.execPath` on an absolute path built with `path.join`, with no
  *   shell, so the suite behaves the same on macOS, Linux and Windows.
  * - Top-level tests in one file run one at a time (the `node:test` default). T17 and T19 rely on
- *   that, because each briefly overrides a process-wide built-in and restores it before it ends.
+ *   that, because each briefly overrides process-wide built-ins and restores them before it ends.
  *
  * Expected texts are written out here rather than imported from the module under test, so a change
  * to any response string fails the suite instead of silently changing what it checks. Non-ASCII
@@ -279,13 +279,21 @@ function assertHead(res, status, declaredLength, label) {
 /**
  * Splits a raw HTTP/1.1 response into its status line, lower-cased headers and body.
  *
+ * Throws when the blank line that ends the head is missing: bytes cut off inside the head are not a
+ * complete response, so they must not read as a full header section with an empty body.
+ *
  * @param {string} text Everything received on the connection.
  * @returns {{ statusLine: string, headers: object, body: string }}
  */
 function parseRawResponse(text) {
   const headEnd = text.indexOf('\r\n\r\n');
-  const head = headEnd === -1 ? text : text.slice(0, headEnd);
-  const body = headEnd === -1 ? '' : text.slice(headEnd + 4);
+  if (headEnd === -1) {
+    throw new Error(
+      `Raw response ends before the blank line that closes its head: ${JSON.stringify(text)}`,
+    );
+  }
+  const head = text.slice(0, headEnd);
+  const body = text.slice(headEnd + 4);
   const [statusLine, ...headerLines] = head.split('\r\n');
   const headers = {};
   for (const line of headerLines) {
@@ -300,21 +308,21 @@ function parseRawResponse(text) {
 
 /**
  * Writes `text` verbatim on a new `node:net` connection and collects everything the server sends
- * until it closes the connection.
+ * until it closes the connection, without interpreting it.
  *
- * Used for CONNECT, whose response `http.request` would deliver through its own `connect` event,
- * and for unrecognised method tokens, which `http.request` would upper-case or refuse to send.
  * When the server ends its side, this client ends its side too (the `net` default), so the server
- * socket closes promptly. A 5-second idle timeout destroys a stalled connection and rejects. A
- * cleanup step of the test destroys the socket, which does nothing once it has closed, so a test
- * that fails or times out mid-exchange cannot leave it open.
+ * socket closes promptly. A 5-second idle timeout destroys a stalled connection and rejects, so a
+ * connection the server leaves open fails the exchange rather than resolving. A cleanup step of
+ * the test destroys the socket, which does nothing once it has closed, so a test that fails or
+ * times out mid-exchange cannot leave it open.
  *
  * @param {import('node:test').TestContext} t The running test, which owns the connection.
  * @param {number} port Port to connect to on 127.0.0.1.
  * @param {string} text The complete raw request, including the blank line that ends the head.
- * @returns {Promise<{ statusLine: string, headers: object, body: string }>}
+ * @returns {Promise<string>} Everything received, decoded as UTF-8; empty when the server closed
+ *   the connection without sending anything.
  */
-function rawRequest(t, port, text) {
+function rawExchange(t, port, text) {
   return new Promise((resolve, reject) => {
     const chunks = [];
     const socket = net.connect(port, HOST, () => socket.write(text));
@@ -325,14 +333,25 @@ function rawRequest(t, port, text) {
     socket.on('data', (chunk) => chunks.push(chunk));
     socket.on('error', reject);
     // After an error the promise is already rejected, and this later settle attempt is ignored.
-    socket.on('close', () => {
-      try {
-        resolve(parseRawResponse(Buffer.concat(chunks).toString('utf8')));
-      } catch (err) {
-        reject(err);
-      }
-    });
+    socket.on('close', () => resolve(Buffer.concat(chunks).toString('utf8')));
   });
+}
+
+/**
+ * Sends `text` with `rawExchange` and splits what came back with `parseRawResponse`, so the
+ * exchange rejects unless a complete response head arrived before the server closed the connection.
+ *
+ * Used for CONNECT, whose response `http.request` would deliver through its own `connect` event,
+ * for unrecognised method tokens, which `http.request` would upper-case or refuse to send, and for
+ * reading exactly what a response the server cut short delivered.
+ *
+ * @param {import('node:test').TestContext} t The running test, which owns the connection.
+ * @param {number} port Port to connect to on 127.0.0.1.
+ * @param {string} text The complete raw request, including the blank line that ends the head.
+ * @returns {Promise<{ statusLine: string, headers: object, body: string }>}
+ */
+async function rawRequest(t, port, text) {
+  return parseRawResponse(await rawExchange(t, port, text));
 }
 
 /**
@@ -567,44 +586,68 @@ function spawnServer(env) {
 }
 
 /**
- * Ensures a spawned child does not outlive its test: a cleanup step kills it if it is still
- * running, then waits for it to close. On Windows `kill()` always terminates forcefully, which is
- * fine here.
+ * Kills a spawned child if it is still running, then waits for it to close. Calling it again once
+ * the child has closed only waits on the settled `closed` promise. On Windows `kill()` always
+ * terminates forcefully, which is fine here.
+ *
+ * @param {ReturnType<typeof spawnServer>} spawned A child started by `spawnServer`.
+ * @returns {Promise<void>}
+ */
+async function stopChild(spawned) {
+  const { child } = spawned;
+  if (child.exitCode === null && child.signalCode === null) {
+    child.kill();
+  }
+  await spawned.closed;
+}
+
+/**
+ * Ensures a spawned child does not outlive its test: a cleanup step stops it with `stopChild`, so a
+ * test that fails or times out before stopping the child itself still leaves nothing running.
  */
 function stopChildAfter(t, spawned) {
-  onCleanup(t, async () => {
-    const { child } = spawned;
-    if (child.exitCode === null && child.signalCode === null) {
-      child.kill();
-    }
-    await spawned.closed;
-  });
+  onCleanup(t, () => stopChild(spawned));
 }
 
 /**
  * Listens on an OS-assigned port with no host, which binds the same unspecified address the service
- * binds, so a service started on that port collides with it on every platform. The close is
+ * binds, so a service started on that port collides with it on every platform. The release is
  * registered as a cleanup step before listening, so the test owns the holder even if listening
- * fails; closing a holder that has already stopped is harmless.
+ * fails; releasing a holder that has already stopped is harmless.
+ *
+ * The holder only occupies the port and serves nothing, so it destroys every connection it accepts
+ * as soon as it arrives. An incidental connection, such as another program probing the port, would
+ * otherwise keep `close()` waiting on that peer past the cleanup deadline and keep the runner
+ * alive. The release also destroys any accepted socket the holder still tracks before it closes
+ * the holder, so shutdown never depends on a peer closing its side.
  *
  * @param {import('node:test').TestContext} t The running test, which owns the holder.
- * @returns {Promise<import('node:net').Server>}
+ * @returns {Promise<{ port: number, release: () => Promise<void> }>} The held port, and a release
+ *   that resolves once the holder has stopped listening and holds no connection.
  */
 function holdPort(t) {
   return new Promise((resolve, reject) => {
-    const holder = net.createServer();
-    onCleanup(t, () => closeServer(holder));
+    const accepted = new Set();
+    const holder = net.createServer((socket) => {
+      accepted.add(socket);
+      socket.once('close', () => accepted.delete(socket));
+      // A socket error with no listener would be thrown as an uncaught exception and end the run.
+      socket.on('error', () => undefined);
+      socket.destroy();
+    });
+    const release = () => {
+      for (const socket of accepted) {
+        socket.destroy();
+      }
+      return new Promise((resolveClose) => holder.close(() => resolveClose()));
+    };
+    onCleanup(t, release);
     holder.once('error', reject);
     holder.listen(0, () => {
       holder.removeListener('error', reject);
-      resolve(holder);
+      resolve({ port: holder.address().port, release });
     });
   });
-}
-
-/** Closes a `net` server and resolves once it has stopped listening. */
-function closeServer(server) {
-  return new Promise((resolve) => server.close(() => resolve()));
 }
 
 /**
@@ -615,10 +658,61 @@ function closeServer(server) {
  * @returns {Promise<number>}
  */
 async function findFreePort(t) {
-  const holder = await holdPort(t);
-  const { port } = holder.address();
-  await closeServer(holder);
+  const { port, release } = await holdPort(t);
+  await release();
   return port;
+}
+
+/**
+ * Runs the entry point with `PORT` set to `raw` and checks the port it selects: stdout must be
+ * exactly one readiness line, naming `expectedPort` as a bare decimal number, and GET / on that
+ * port must return the default greeting. The child is then stopped, so a test can check several
+ * values one after another with only one child running; if an assertion fails first, the cleanup
+ * step from `stopChildAfter` stops it.
+ *
+ * @param {import('node:test').TestContext} t The running test, which owns the child.
+ * @param {string} raw The `PORT` value, exactly as the child receives it.
+ * @param {number | null} expectedPort The port the readiness line must name, or `null` when the OS
+ *   chooses it (`PORT=0`), in which case the line must name a port from 1 to 65535.
+ * @returns {Promise<void>}
+ */
+async function assertServesWithPort(t, raw, expectedPort) {
+  const label = `PORT=${JSON.stringify(raw)}`;
+  const spawned = spawnServer({ PORT: raw });
+  stopChildAfter(t, spawned);
+
+  // The readiness line is all the service prints, and its newline ends it, so this waits for the
+  // complete line. A child that exits first rejects the wait, and the label names the value.
+  try {
+    await spawned.waitForStdout('\n');
+  } catch (err) {
+    throw new Error(`${label}: ${err.message}`, { cause: err });
+  }
+  const match = /^Listening on http:\/\/localhost:(\d+)\n$/.exec(spawned.stdout);
+  assert.ok(
+    match,
+    `${label}: stdout must be one readiness line; received ${JSON.stringify(spawned.stdout)}`,
+  );
+  const port = Number(match[1]);
+  if (expectedPort === null) {
+    // The line must name the port actually bound, never the 0 that was asked for.
+    assert.ok(
+      Number.isInteger(port) && port >= 1 && port <= 65535,
+      `${label}: the readiness line must name the assigned port; received ${match[1]}`,
+    );
+  } else {
+    assert.strictEqual(port, expectedPort, `${label}: port named by the readiness line`);
+  }
+  // Compared whole, so a line that repeats PORT's padding or leading zeros fails.
+  assert.strictEqual(
+    spawned.stdout,
+    `Listening on http://localhost:${port}\n`,
+    `${label}: readiness line`,
+  );
+
+  // The service binds the unspecified address, so the IPv4 loopback reaches it.
+  assertText(await request(t, port, { path: '/' }), 200, HELLO_WORLD, `${label}: GET /`);
+  await stopChild(spawned);
 }
 
 /** Returns the arguments of every call recorded by a `t.mock.method` mock. */
@@ -1214,21 +1308,23 @@ test('T13: an unexpected error returns 500, logs no request data, and the server
 });
 
 test('T14: PORT selects the listening port of the real entry point', LIFECYCLE_TEST, async (t) => {
+  // Each value runs on a port that is free at run time; none is fixed.
   const port = await findFreePort(t);
-  const spawned = spawnServer({ PORT: String(port) });
-  stopChildAfter(t, spawned);
+  await assertServesWithPort(t, String(port), port);
 
-  const line = `Listening on http://localhost:${port}`;
-  await spawned.waitForStdout(`${line}\n`);
-  assert.strictEqual(spawned.stdout, `${line}\n`);
+  // The value is trimmed, because cmd's `set PORT=4000 && npm start` leaves a trailing space, and
+  // read as decimal digits, so leading zeros are accepted too.
+  const spacedPort = await findFreePort(t);
+  await assertServesWithPort(t, ` ${spacedPort} `, spacedPort);
+  const zeroPaddedPort = await findFreePort(t);
+  await assertServesWithPort(t, `0${zeroPaddedPort}`, zeroPaddedPort);
 
-  // The service binds the unspecified address, so the IPv4 loopback reaches it.
-  assertText(await request(t, port, { path: '/' }), 200, HELLO_WORLD);
+  // PORT=0 lets the OS choose, and the readiness line names the port it assigned.
+  await assertServesWithPort(t, '0', null);
 });
 
 test('T15: a port already in use prints a message naming the port and exits with code 1', LIFECYCLE_TEST, async (t) => {
-  const holder = await holdPort(t);
-  const { port } = holder.address();
+  const { port } = await holdPort(t);
 
   const spawned = spawnServer({ PORT: String(port) });
   stopChildAfter(t, spawned);
@@ -1260,7 +1356,7 @@ test('T16: an invalid PORT prints an error and exits with code 1 without listeni
   }
 });
 
-test('T17: CONNECT gets a raw 405 on / and 404 elsewhere, and a raw 500 when answering fails', IN_PROCESS_TEST, async (t) => {
+test('T17: CONNECT gets a raw 405 on / and 404 elsewhere, a raw 500 when answering fails, and a closed connection when no 500 is possible', IN_PROCESS_TEST, async (t) => {
   const port = await startServer(t);
 
   const onRoot = await rawRequest(t, port, 'CONNECT / HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n');
@@ -1285,15 +1381,17 @@ test('T17: CONNECT gets a raw 405 on / and 404 elsewhere, and a raw 500 when ans
   assert.strictEqual(original.value, 'Method Not Allowed');
   const restore = () => Object.defineProperty(http.STATUS_CODES, '405', original);
   onCleanup(t, restore);
+  const breakStatusLookup = () =>
+    Object.defineProperty(http.STATUS_CODES, '405', {
+      configurable: true,
+      enumerable: true,
+      get() {
+        throw new Error('status lookup failed');
+      },
+    });
 
   const log = t.mock.method(console, 'error', () => {});
-  Object.defineProperty(http.STATUS_CODES, '405', {
-    configurable: true,
-    enumerable: true,
-    get() {
-      throw new Error('status lookup failed');
-    },
-  });
+  breakStatusLookup();
   let failed;
   try {
     failed = await rawRequest(t, port, 'CONNECT / HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n');
@@ -1306,11 +1404,68 @@ test('T17: CONNECT gets a raw 405 on / and 404 elsewhere, and a raw 500 when ans
   assert.strictEqual(log.mock.callCount(), 1);
   assert.deepStrictEqual(callArguments(log), [[`${UNEXPECTED_ERROR_LOG} (stage: connect): Error`]]);
 
+  // From here every `end` on this server's accepted sockets throws. Client sockets keep the real
+  // method, because `net` ends them itself once the server's side closes. Each exchange must close
+  // with nothing received: a socket the listener left open would instead time out and reject.
+  const realEnd = net.Socket.prototype.end;
+  const end = t.mock.method(net.Socket.prototype, 'end', function (...args) {
+    if (this.localPort === port) {
+      throw new Error('end failed');
+    }
+    return realEnd.apply(this, args);
+  });
+  try {
+    // Writing the committed 405 fails: no 500 may follow a committed response, so the listener
+    // destroys the socket after its one diagnostic.
+    log.mock.resetCalls();
+    const committed = await rawExchange(t, port, 'CONNECT / HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n');
+    assert.strictEqual(committed, '', 'a CONNECT response that fails once committed gets no 500');
+    assert.deepStrictEqual(callArguments(log), [
+      [`${UNEXPECTED_ERROR_LOG} (stage: connect): Error`],
+    ]);
+
+    // Failing before the commit, as above, while the raw 500 cannot be written either: the listener
+    // logs both failures and destroys the socket.
+    log.mock.resetCalls();
+    breakStatusLookup();
+    let unrecoverable;
+    try {
+      unrecoverable = await rawExchange(t, port, 'CONNECT / HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n');
+    } finally {
+      restore();
+    }
+    assert.strictEqual(unrecoverable, '', 'a CONNECT whose raw 500 also fails gets nothing');
+    assert.deepStrictEqual(callArguments(log), [
+      [`${UNEXPECTED_ERROR_LOG} (stage: connect): Error`],
+      ['Could not send the 500 response: Error'],
+    ]);
+  } finally {
+    end.mock.restore();
+  }
+
+  // With every override removed, CONNECT is answered normally again.
+  const recovered = await rawRequest(t, port, 'CONNECT / HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n');
+  assertRawText(
+    recovered,
+    'HTTP/1.1 405 Method Not Allowed',
+    METHOD_NOT_ALLOWED,
+    'CONNECT / after the failures',
+  );
+  assert.strictEqual(recovered.headers.allow, 'GET', 'CONNECT / after the failures');
+
   // The same server keeps serving ordinary requests.
   assertText(await request(t, port, { path: '/' }), 200, HELLO_WORLD, 'GET / after CONNECT');
 });
 
 test('T18: a method token the parser does not recognise gets Node native 400 and the server keeps serving', IN_PROCESS_TEST, async (t) => {
+  // The framing assertions below only mean something if bytes cut off before the blank line that
+  // ends the head fail to parse, instead of reading as a complete head with an empty body.
+  const truncated = 'HTTP/1.1 400 Bad Request\r\nConnection: close';
+  assert.throws(() => parseRawResponse(truncated), {
+    message:
+      'Raw response ends before the blank line that closes its head: ' + JSON.stringify(truncated),
+  });
+
   const port = await startServer(t);
 
   for (const requestLine of ['FOO / HTTP/1.1', 'get / HTTP/1.1']) {
@@ -1324,7 +1479,7 @@ test('T18: a method token the parser does not recognise gets Node native 400 and
   assertText(await request(t, port, { path: '/' }), 200, HELLO_WORLD, 'GET / after native 400s');
 });
 
-test('T19: when the 500 cannot be written either, the connection is destroyed and the server keeps serving', IN_PROCESS_TEST, async (t) => {
+test('T19: when the 500 cannot be written, or headers were already sent, the connection is destroyed and the server keeps serving', IN_PROCESS_TEST, async (t) => {
   const port = await startServer(t);
   const log = t.mock.method(console, 'error', () => {});
   // Only server responses use `ServerResponse.prototype.writeHead`; the test client does not.
@@ -1348,6 +1503,43 @@ test('T19: when the 500 cannot be written either, the connection is destroyed an
     200,
     HELLO_WORLD,
     'GET / after a destroyed connection',
+  );
+
+  // Now fail after the status line is committed: the real `writeHead` runs and its head is flushed
+  // to the client before the throw, so no 500 can replace it. The connection must end with only
+  // that head delivered, and only the handling failure is logged, since no 500 is attempted.
+  log.mock.resetCalls();
+  const realWriteHead = http.ServerResponse.prototype.writeHead;
+  const committedWriteHead = t.mock.method(
+    http.ServerResponse.prototype,
+    'writeHead',
+    function (...args) {
+      realWriteHead.apply(this, args);
+      this.flushHeaders();
+      throw new Error('failed after the head was sent');
+    },
+  );
+  let cutShort;
+  try {
+    // A raw client shows exactly what arrived; `http.request` would report only the abort.
+    cutShort = await rawRequest(t, port, 'GET / HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n');
+  } finally {
+    committedWriteHead.mock.restore();
+  }
+
+  assert.strictEqual(cutShort.statusLine, 'HTTP/1.1 200 OK', 'committed GET /');
+  assert.strictEqual(cutShort.headers['content-type'], TEXT_TYPE, 'committed GET /');
+  assert.strictEqual(cutShort.headers['content-length'], '13', 'committed GET /');
+  assert.strictEqual(cutShort.body, '', 'the connection ends before any of the declared body');
+  assert.deepStrictEqual(callArguments(log), [
+    [`${UNEXPECTED_ERROR_LOG} (stage: responding): Error`],
+  ]);
+
+  assertText(
+    await request(t, port, { path: '/' }),
+    200,
+    HELLO_WORLD,
+    'GET / after a committed response was destroyed',
   );
 });
 
