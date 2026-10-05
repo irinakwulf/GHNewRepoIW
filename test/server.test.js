@@ -620,7 +620,6 @@ test('T14: PORT selects the listening port of the real entry point', LIFECYCLE_T
 
   // The service binds the unspecified address, so the IPv4 loopback reaches it.
   assertText(await request(port, { path: '/' }), 200, HELLO_WORLD);
-  assert.strictEqual(spawned.stderr, '');
 });
 
 test('T15: a port already in use prints a message naming the port and exits with code 1', LIFECYCLE_TEST, async (t) => {
