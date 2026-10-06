@@ -333,8 +333,10 @@ function rawExchange(t, port, text) {
  * exchange rejects unless a complete response head arrived before the server closed the connection.
  *
  * Used for CONNECT, whose response `http.request` would deliver through its own `connect` event,
- * for unrecognised method tokens, which `http.request` would upper-case or refuse to send, and for
- * reading exactly what a response the server cut short delivered.
+ * for unrecognised method tokens, and for reading exactly what a response the server cut short
+ * delivered. `http.request` upper-cases a lower-case token such as `get` and rejects text that is
+ * not a valid token, so the raw client sends every parser-boundary probe byte for byte and reads
+ * Node's native reply exactly.
  *
  * @param {import('node:test').TestContext} t The running test, which owns the connection.
  * @param {number} port Port to connect to on 127.0.0.1.
