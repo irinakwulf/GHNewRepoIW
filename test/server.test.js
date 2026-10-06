@@ -47,13 +47,13 @@ const METHOD_NOT_ALLOWED = 'Method not allowed.';
 const SERVER_ERROR = 'Something went wrong.';
 
 /**
- * Inactivity timeout that `request`, `rawExchange` (and so `rawRequest`), `keepAliveExchange` and
- * `keepAliveRequests` arm on each client socket they open: a connection that sends or receives
- * nothing for 5 seconds is destroyed and its exchange rejects, so a stall fails instead of
- * hanging. Traffic resets it, so it does not cap an exchange's total duration; the 10-second
- * per-test timeout bounds that instead. The half-open CONNECT probe does not use it: its trickle
- * of writes keeps the socket active, which would keep resetting this timeout, so that probe has
- * its own 2-second absolute deadline.
+ * Inactivity timeout that `request`, `rawExchange` (and so `rawRequest`), `keepAliveExchange`,
+ * `keepAliveRequests` and the half-open CONNECT probe arm on each client socket they open: a
+ * connection that sends or receives nothing for 5 seconds is destroyed and its exchange rejects,
+ * so a stall fails instead of hanging. Traffic resets it, so it does not cap an exchange's total
+ * duration; the 10-second per-test timeout bounds that instead. Once the half-open probe ends its
+ * side, it also gives the server 2 seconds to close the connection, well inside the listener's
+ * 5-second idle timeout, so only the probe's end can account for that close.
  */
 const IO_TIMEOUT_MS = 5000;
 
@@ -152,7 +152,8 @@ function withCleanupDeadline(promise) {
  *
  * `closeAllConnections()` ends any keep-alive socket before the awaited `close()`, so shutdown never
  * waits on an idle connection. Sockets handed to the CONNECT listener are outside that call; they
- * close once their response is flushed, and in any case within the listener's own idle timeout.
+ * close when the client ends its side after the server's `end()`, and in any case within the
+ * listener's 5-second idle timeout.
  *
  * @param {import('node:test').TestContext} t The running test, which owns the server.
  * @param {{ greet?: Function }} [options] Passed through to `createServer`.
@@ -1440,47 +1441,126 @@ test('T17: CONNECT gets a raw 405 on / and 404 elsewhere, a raw 500 when answeri
   assert.strictEqual(elsewhere.headers.allow, undefined, 'CONNECT example.com:443');
   assert.strictEqual(elsewhere.headers['content-length'], '10', 'CONNECT example.com:443');
 
-  // A peer that withholds its end and keeps sending refreshes the listener's idle timeout forever,
-  // so the server itself must close a rejected CONNECT once its response is flushed.
+  // After its response the listener ends only its own side and keeps discarding input, so a client
+  // may go on sending without being reset, and the client's own end, not the listener's 5-second
+  // idle timeout, closes the connection. A client's `close` after its own `end` is local, so the
+  // probe watches the server's socket, found through the `end` call that writes the response.
   const halfOpenExchange = (text) =>
     new Promise((resolve, reject) => {
-      const deadlineMs = 2000;
+      const requestLine = JSON.stringify(text.split('\r\n', 1)[0]);
+      const trickleChunk = 'x'.repeat(1024);
+      const trickleWrites = 10;
+      const trickleIntervalMs = 20;
+      const closeDeadlineMs = 2000;
       const chunks = [];
+      let serverSocket = null;
+      let clientEnded = false;
+      let clientClosed = false;
+      let serverClosed = false;
+      let settled = false;
       let trickle = null;
+      let closeDeadline = null;
+
+      const settle = (err) => {
+        if (settled) {
+          return;
+        }
+        settled = true;
+        clearInterval(trickle);
+        clearTimeout(closeDeadline);
+        endSpy.mock.restore();
+        if (err) {
+          socket.destroy();
+          reject(err);
+          return;
+        }
+        resolve(Buffer.concat(chunks).toString('utf8'));
+      };
+      const onServerClose = () => {
+        if (!clientEnded) {
+          settle(new Error(`the server closed ${requestLine} before the client ended its side`));
+          return;
+        }
+        serverClosed = true;
+        if (clientClosed) {
+          settle();
+        }
+      };
+
+      // Passes every call through; it only picks out the server's socket for this connection.
+      const originalEnd = net.Socket.prototype.end;
+      const endSpy = t.mock.method(net.Socket.prototype, 'end', function (...args) {
+        const ours = this.localPort === port && this.remotePort === socket.localPort;
+        if (serverSocket === null && ours) {
+          serverSocket = this;
+          this.once('close', onServerClose);
+        }
+        return originalEnd.apply(this, args);
+      });
+
       const socket = net.connect({ port, host: HOST, allowHalfOpen: true }, () => {
         socket.write(text);
       });
       onCleanup(t, () => {
-        socket.destroy();
-      });
-      const deadline = setTimeout(() => {
-        reject(
-          new Error(
-            `the server kept a half-open CONNECT socket open for ${deadlineMs} ms after its ` +
-              `response to ${JSON.stringify(text.split('\r\n')[0])}`,
-          ),
-        );
-        socket.destroy();
-      }, deadlineMs);
-      socket.on('data', (chunk) => chunks.push(chunk));
-      socket.on('end', () => {
-        trickle = setInterval(() => socket.write('x'), 50);
-      });
-      socket.on('error', (err) => {
-        // Once the trickle starts, EPIPE or ECONNRESET is how a server-side close shows up.
-        if (trickle === null) {
-          reject(err);
-        }
-      });
-      socket.on('close', () => {
-        clearTimeout(deadline);
         clearInterval(trickle);
-        resolve(Buffer.concat(chunks).toString('utf8'));
+        clearTimeout(closeDeadline);
+        socket.destroy();
+      });
+      socket.setTimeout(IO_TIMEOUT_MS, () => {
+        socket.destroy(new Error(`half-open ${requestLine} timed out`));
+      });
+      socket.on('data', (chunk) => chunks.push(chunk));
+      // The whole response and the server's end have arrived: keep sending for a while, then end.
+      socket.on('end', () => {
+        if (serverSocket === null) {
+          settle(new Error(`the server did not answer ${requestLine} through its socket's end()`));
+          return;
+        }
+        let writes = 0;
+        trickle = setInterval(() => {
+          if (writes < trickleWrites) {
+            socket.write(trickleChunk);
+            writes += 1;
+            return;
+          }
+          clearInterval(trickle);
+          if (serverSocket.destroyed) {
+            settle(
+              new Error(`the server destroyed ${requestLine} before the client ended its side`),
+            );
+            return;
+          }
+          clientEnded = true;
+          socket.end();
+          closeDeadline = setTimeout(() => {
+            settle(
+              new Error(
+                `the server kept ${requestLine} open for ${closeDeadlineMs} ms after the client ` +
+                  'ended its side',
+              ),
+            );
+          }, closeDeadlineMs);
+        }, trickleIntervalMs);
+      });
+      socket.on('error', settle);
+      socket.on('close', () => {
+        if (!clientEnded) {
+          settle(new Error(`the client socket for ${requestLine} closed before it ended its side`));
+          return;
+        }
+        clientClosed = true;
+        if (serverClosed) {
+          settle();
+        }
       });
     });
 
+  // The head and 128 KiB of early data go in one write. That is more than one socket read, so part
+  // of it is still unread when the response goes out, when a destroy would send RST and cost the
+  // client its response.
+  const earlyData = 'x'.repeat(128 * 1024);
   const halfOpenRoot = parseRawResponse(
-    await halfOpenExchange('CONNECT / HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n'),
+    await halfOpenExchange(`CONNECT / HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n${earlyData}`),
   );
   assertRawText(
     halfOpenRoot,

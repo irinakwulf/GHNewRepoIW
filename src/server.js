@@ -208,13 +208,13 @@ function rejectConnect(req, socket) {
         : rawResponse(404, MESSAGES.notFound);
 
     committed = true;
-    // Destroy once flushed: this socket allows half-open use, so a sending peer would keep it open.
-    socket.end(response, () => socket.destroy());
+    // Half-close only; the peer's FIN or idle timeout closes it, as a destroy with input unread sends RST.
+    socket.end(response);
   } catch (err) {
     logSafely(`Unexpected error while handling a request (stage: connect): ${describeError(err)}`);
     if (!committed && socket.writable) {
       try {
-        socket.end(rawResponse(500, MESSAGES.serverError), () => socket.destroy());
+        socket.end(rawResponse(500, MESSAGES.serverError));
         return;
       } catch (recoveryErr) {
         logSafely(`Could not send the 500 response: ${describeError(recoveryErr)}`);
