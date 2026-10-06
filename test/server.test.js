@@ -5,23 +5,14 @@
  *
  * It covers every row of the service's interface, both sides of the 50/51 name-length boundary,
  * CONNECT and the parser's method boundary, the 500 and failed-recovery paths, and the start-up
- * lifecycle: cases T1 to T20, one top-level test each.
+ * lifecycle.
  *
- * Isolation and portability:
- * - Every client connection goes to 127.0.0.1 on a port chosen at run time, so the run needs no
- *   network, no DNS, and never needs port 3000 to be free. In-process servers listen on 127.0.0.1.
- *   The spawned entry point listens with no host, on the unspecified address, and the port holders
- *   bind that same address, so the port-in-use collision happens on every platform.
- * - Every server, socket and child process a test opens is closed or killed in that test's own
- *   `t.after`. Each test has one such hook, which runs every cleanup step newest first and reports
- *   a failure only after all steps have run, so one stuck resource cannot leave the others open.
- *   The steps are idempotent, so a resource that already closed on completion is left as it is.
- * - Every wait is bounded by the 5-second socket timeout, the test's own timeout or the 10-second
- *   deadline on each cleanup step, so the run exits on its own.
- * - Child processes run `process.execPath` on an absolute path built with `path.join`, with no
- *   shell, so the suite behaves the same on macOS, Linux and Windows.
- * - Top-level tests in one file run one at a time (the `node:test` default). T17 and T19 rely on
- *   that, because each briefly overrides process-wide built-ins and restores them before it ends.
+ * Every client connection goes to 127.0.0.1 on a port the OS assigns at run time, so the run needs
+ * no network or DNS and never depends on a fixed port, such as 3000, being free.
+ *
+ * Top-level tests run one at a time (the `node:test` default). Tests that briefly override
+ * process-wide built-ins rely on that: each override is undone before the next test starts, so it
+ * never leaks into another test.
  *
  * Expected texts are written out here rather than imported from the module under test, so a change
  * to any response string fails the suite instead of silently changing what it checks. Non-ASCII
@@ -46,7 +37,6 @@ const SERVER_PATH = path.join(__dirname, '..', 'src', 'server.js');
  */
 const HOST = '127.0.0.1';
 
-/** Media type every application-generated response must carry. */
 const TEXT_TYPE = 'text/plain; charset=utf-8';
 
 /** The fixed response bodies, character for character, with no trailing newline. */
@@ -64,7 +54,6 @@ const SERVER_ERROR = 'Something went wrong.';
  */
 const IO_TIMEOUT_MS = 5000;
 
-/** Options for each test that spawns the real entry point: a bound on the whole test. */
 const LIFECYCLE_TEST = Object.freeze({ timeout: 10000 });
 
 /** Options for each in-process test: a bound on the whole test, set-up waits included. */
@@ -77,7 +66,6 @@ const IN_PROCESS_TEST = Object.freeze({ timeout: 10000 });
  */
 const CLEANUP_TIMEOUT_MS = 10000;
 
-/** Diagnostic prefix the service logs for an exception raised while a request is handled. */
 const UNEXPECTED_ERROR_LOG = 'Unexpected error while handling a request';
 
 /** Each running test's cleanup steps, keyed by its context, in the order they were registered. */
@@ -385,17 +373,25 @@ function assertRawText(res, statusLine, body, label) {
  * framed in bytes by its `content-length`; everything after it, until the server closes the
  * connection, is the second response.
  *
- * T9 uses it for a POST whose body is still arriving. `http.request` with `agent: false` asks the
- * server to close the connection after its response, so it cannot show what becomes of the rest of
- * the body; a keep-alive connection can. When `first` holds the head and only part of the body, a
- * complete response to it shows the server answered without waiting for the body. When `second`
- * holds the rest of the body and then a request with `Connection: close`, an exact response to that
- * request shows the server discarded the body and kept the connection in step.
+ * A POST must be answered while its body is still arriving, and the rest of that body must be
+ * drained so the connection stays in step. `http.request` with `agent: false` asks the server to
+ * close the connection after its response, so it cannot show what becomes of the rest of the body;
+ * a keep-alive connection can. When `first` holds the head and only part of the body, a complete
+ * response to it shows the server answered without waiting for the body. When `second` holds the
+ * rest of the body and then a request with `Connection: close`, an exact response to that request
+ * shows the server discarded the body and kept the connection in step.
  *
- * It rejects on a head without its terminating blank line, a first response without exactly one
- * decimal `content-length`, a connection that closes before a response is complete, a transport
- * error, or a 5-second idle timeout. A cleanup step of the test destroys the socket, which does
- * nothing once it has closed, so a test that fails or times out mid-exchange cannot leave it open.
+ * The exchange rejects unless the first response's head carries exactly one decimal
+ * `content-length` and that head and the body it declares arrive in full before the connection
+ * closes. The second response is collected rather than framed, because the server's close ends it:
+ * once the connection closes, the exchange resolves if a complete second head has arrived, and
+ * takes every byte after that head as the body without comparing it with the declared
+ * `content-length`. The caller's assertions therefore validate the second body, and an exact
+ * comparison catches one cut short or followed by extra bytes. The exchange also rejects on a close
+ * before the second head is complete, a header line without a colon or a repeated `content-length`
+ * in either head, a transport error, or a 5-second idle timeout. A cleanup step of the test
+ * destroys the socket, which does nothing once it has closed, so a test that fails or times out
+ * mid-exchange cannot leave it open.
  *
  * @param {import('node:test').TestContext} t The running test, which owns the connection.
  * @param {number} port Port to connect to on 127.0.0.1.
@@ -796,10 +792,6 @@ async function keepAliveRequests(t, port, targets) {
   return results;
 }
 
-// ---------------------------------------------------------------------------------------------
-// Interface rows: greeting, trimming, fallback, length boundary, routes and methods (T1 to T12)
-// ---------------------------------------------------------------------------------------------
-
 test('T1: GET / returns 200 Hello, world! as plain text with no trailing newline', IN_PROCESS_TEST, async (t) => {
   const port = await startServer(t);
 
@@ -972,7 +964,7 @@ test('T7: the 50-character limit counts code points, not UTF-16 units or graphem
   assert.strictEqual(tooManyAcutes.headers['content-length'], '36', '26 decomposed e-acute');
 
   // The echoed name is not normalised either. NFC would return the precomposed `Zo\u00EB` in
-  // 12 bytes, the form T12 pins, and NFKC would turn the U+FB01 ligature into `fi`.
+  // 12 bytes, and NFKC would turn the U+FB01 ligature into `fi`.
   const combining = await request(t, port, { path: '/?name=Zoe%CC%88' });
   assertText(combining, 200, 'Hello, Zoe\u0308!', 'Zoe%CC%88');
   assert.strictEqual(combining.headers['content-length'], '13', 'Zoe%CC%88');
@@ -1088,11 +1080,6 @@ test('T12: names are decoded as UTF-8, leniently, with a byte-accurate content-l
   assert.strictEqual(invalid.headers['content-length'], '11', '%FF');
 });
 
-
-// ---------------------------------------------------------------------------------------------
-// Error boundary, start-up lifecycle, CONNECT and the parser boundary (T13 to T20)
-// ---------------------------------------------------------------------------------------------
-
 test('T13: an unexpected error returns 500, logs no request data, and the server keeps serving', IN_PROCESS_TEST, async (t) => {
   // Throws an error whose message, code and stack frame are all built from the requested name, so
   // logging any of them would reveal who was greeted.
@@ -1145,10 +1132,12 @@ test('T13: an unexpected error returns 500, logs no request data, and the server
   assert.doesNotMatch(logged, /zelda7f3k/i);
   assert.doesNotMatch(logged, /\?name=/);
 
-  // The thrown values the payload above leaves untried. Each is selected by a requested name that
-  // carries the same token, and builds every name, class name, message and code it has from that
-  // name, so a diagnostic that read any of them would fail the privacy checks. The label is the
-  // literal the service must print for it.
+  // The thrown values the payload above leaves untried, each selected by a requested name that
+  // carries the same token. Every message, thrown string, `name` and subclass name is built from
+  // that name, as is the prefixed code, so a diagnostic that read any of them would fail the
+  // privacy checks. The other codes are fixed copies of allowlist entries, which the service may
+  // print. Those and the prefixed code test selection: only an error whose `code` strictly equals
+  // an entry gets that code appended. Each variant's label is the literal the service must print.
   const variantMessage = (rawName) => `could not greet ${rawName} at /?name=${rawName}`;
   // A subclass of a built-in error class, named after the requested name, with that name as its
   // `name` too. AggregateError takes its inner errors before the message.
