@@ -12,6 +12,8 @@
  *   name over 50 code points      -> 400 "Name must be 50 characters or fewer."
  *   any other path                -> 404 "Not found."
  *   any non-GET method on /       -> 405 "Method not allowed." with "Allow: GET"
+ *   HEAD on / or any other path   -> the 405 or 404 status and headers, including that body's
+ *                                    Content-Length (19 or 10), but no body
  *   an unexpected error           -> 500 "Something went wrong.", or a destroyed connection when a
  *                                    replacement response can no longer be written
  *
@@ -35,7 +37,6 @@ const MAX_NAME_LENGTH = 50;
 /** Port used when `PORT` is unset or blank. */
 const DEFAULT_PORT = 3000;
 
-/** Media type of every response the service generates. */
 const CONTENT_TYPE = 'text/plain; charset=utf-8';
 
 /** Idle lifetime of a socket handed to the CONNECT listener, which Node's request timeouts no longer cover. */
@@ -112,9 +113,9 @@ function greet(rawName) {
     return { statusCode: 200, body: MESSAGES.helloWorld };
   }
 
-  // Count Unicode code points rather than `name.length`, which counts UTF-16 units and would make
-  // each emoji count twice. Grapheme counting (`Intl.Segmenter`) depends on the ICU build, whereas
-  // code points give the same answer on every Node build. No normalisation is applied.
+  // Count Unicode code points, not `name.length`: it counts UTF-16 units, in which supplementary-plane
+  // code points (most emoji, e.g. `😀`) occupy two. Grapheme counting (`Intl.Segmenter`) depends on
+  // the ICU build; code points give the same answer on every Node build. No normalisation is applied.
   if (Array.from(name).length > MAX_NAME_LENGTH) {
     return { statusCode: 400, body: MESSAGES.nameTooLong };
   }
@@ -133,21 +134,13 @@ function textHeaders(body, extraHeaders) {
   };
 }
 
-/**
- * Writes one complete plain-text response. For HEAD, Node keeps the declared `Content-Length` of the
- * body this route selects and suppresses the body itself, which is the intended HEAD behaviour.
- */
+/** For HEAD, Node keeps the Content-Length of the body this route selects and sends no body, as intended. */
 function send(res, statusCode, body, extraHeaders) {
   res.writeHead(statusCode, textHeaders(body, extraHeaders));
   res.end(body);
 }
 
-/**
- * Splits a request target at its first `?` into the raw path and the raw query (`''` when absent).
- * The path is matched exactly, with no decoding or normalisation. `new URL(target, base)` is avoided
- * on purpose: `new URL('//', base)` throws, and `new URL('//about', base).pathname` is `/`, which
- * would greet on `GET //about`.
- */
+/** Splits at the first `?` for exact path matching; `new URL` throws on `//` and reads `//about` as `/`. */
 function splitTarget(target) {
   const queryStart = target.indexOf('?');
   if (queryStart === -1) {
@@ -156,20 +149,7 @@ function splitTarget(target) {
   return { path: target.slice(0, queryStart), query: target.slice(queryStart + 1) };
 }
 
-/**
- * Describes a thrown value using only literals from this file, and never throws.
- *
- * An error's message, name, code and stack frames can all be built from request data (a greeted
- * name can appear in a message, a code or a function name in a stack frame), and the service must
- * record nothing about who is greeted. So only two things are reported: the built-in class, matched
- * by `instanceof` and printed as a literal label, and the code, printed only when it strictly equals
- * an allowlisted literal (the allowlist's own string is printed). `message`, `name`, `stack` and the
- * constructor are never read. Any failure, such as a throwing `code` getter or a hostile prototype,
- * yields the fixed fallback text instead of a partial description.
- *
- * @param {unknown} err The thrown value.
- * @returns {string} For example `TypeError` or `RangeError [ERR_HTTP_INVALID_STATUS_CODE]`.
- */
+/** Class label + allowlisted code only (request data reaches message/name/stack); falls back, never throws. */
 function describeError(err) {
   try {
     let label = null;
@@ -199,16 +179,10 @@ function describeError(err) {
 function logSafely(line) {
   try {
     console.error(line);
-  } catch {
-    // Deliberately ignored: the diagnostic is best-effort, while answering the client is not.
-  }
+  } catch {}
 }
 
-/**
- * Builds a complete raw HTTP/1.1 response for a socket that Node's response machinery no longer owns.
- * The reason phrase is read from `http.STATUS_CODES` at call time. Headers follow `textHeaders`
- * order plus `Connection: close`, because the server ends the connection after this response.
- */
+/** Frames a raw response, with `Connection: close`, for a socket Node's response machinery no longer owns. */
 function rawResponse(status, body, extraHeaders) {
   const lines = [`HTTP/1.1 ${status} ${http.STATUS_CODES[status]}`];
   const headers = textHeaders(body, { ...extraHeaders, Connection: 'close' });
@@ -218,18 +192,7 @@ function rawResponse(status, body, extraHeaders) {
   return `${lines.join('\r\n')}\r\n\r\n${body}`;
 }
 
-/**
- * The server's `connect` listener. Node never passes CONNECT to the request listener, and without a
- * `connect` listener it closes the connection with no response at all, so CONNECT would neither get
- * its 405 on `/` nor its 404 elsewhere. This listener applies the same rules as the request handler
- * and answers with a raw response, then ends the connection. No tunnel is ever opened.
- *
- * A handed-off socket is outside Node's request timeouts and `closeAllConnections()`, so this
- * listener bounds its life itself: an idle timeout and an `error` listener both destroy it.
- *
- * Failures follow the same policy as the request handler: log a literal-only diagnostic, send a raw
- * 500 while nothing has been committed and the socket is writable, and otherwise destroy the socket.
- */
+/** CONNECT skips the request listener, so this replies raw 405/404, opens no tunnel and owns the socket. */
 function rejectConnect(req, socket) {
   let committed = false;
   try {
@@ -245,12 +208,13 @@ function rejectConnect(req, socket) {
         : rawResponse(404, MESSAGES.notFound);
 
     committed = true;
-    socket.end(response);
+    // Destroy once flushed: this socket allows half-open use, so a sending peer would keep it open.
+    socket.end(response, () => socket.destroy());
   } catch (err) {
     logSafely(`Unexpected error while handling a request (stage: connect): ${describeError(err)}`);
     if (!committed && socket.writable) {
       try {
-        socket.end(rawResponse(500, MESSAGES.serverError));
+        socket.end(rawResponse(500, MESSAGES.serverError), () => socket.destroy());
         return;
       } catch (recoveryErr) {
         logSafely(`Could not send the 500 response: ${describeError(recoveryErr)}`);
@@ -262,22 +226,22 @@ function rejectConnect(req, socket) {
 
 /**
  * Creates a new, independent hello-service HTTP server that is not yet listening; the caller decides
- * where it listens. Each call builds a fresh server, and nothing is shared between servers.
+ * where it listens. Each call builds a fresh server. The service shares no mutable state between
+ * servers: module scope holds only constants, frozen tables and functions.
  *
  * @example
  *   const server = createServer();
  *   server.listen(0, '127.0.0.1', () => console.log(server.address().port));
  *
- * @param {{ greet?: typeof greet }} [options] `options.greet` replaces the greeting function. It
- *   exists so tests can force the 500 path through the real error boundary; production code passes
- *   nothing and gets `greet`.
+ * @param {{ greet?: typeof greet }} [options] Optional settings; production code passes none.
+ * @param {typeof greet} [options.greet] Replacement greeting function; `greet` is used when it is
+ *   absent or not a function. It lets tests force the 500 path through the real error boundary.
  * @returns {import('node:http').Server} A server with the request and CONNECT listeners attached.
  */
 function createServer(options) {
   const greetFn = options && typeof options.greet === 'function' ? options.greet : greet;
 
-  // Fully synchronous (no I/O, promises or callbacks), so the try/catch below sees every exception
-  // raised while the request is handled, including one from writing the response itself.
+  // Synchronous, so the catch sees throws from routing, greeting and the write calls, not later I/O errors.
   function handleRequest(req, res) {
     // Stage label for diagnostics only; always one of three literals.
     let stage = 'routing';
@@ -332,14 +296,7 @@ function createServer(options) {
   return server;
 }
 
-/**
- * Parses the `PORT` environment value. Returns `DEFAULT_PORT` when unset or blank, the port for
- * decimal digits from 0 to 65535 (0 lets the OS choose), and `null` for anything else.
- *
- * The value is trimmed because cmd's `set PORT=4000 && npm start` leaves a trailing space. Strict
- * validation is needed because a non-numeric string would make Node listen on a pipe or socket path,
- * and an out-of-range number would throw `ERR_SOCKET_BAD_PORT` with a stack trace.
- */
+/** Trims cmd's `set PORT=4000 && npm start` space; strict 0-65535: text is a pipe path, 65536+ throws. */
 function parsePort(raw) {
   if (raw === undefined) {
     return DEFAULT_PORT;
@@ -354,13 +311,7 @@ function parsePort(raw) {
   return null;
 }
 
-/**
- * Starts the service on `PORT` (default 3000). Runs only when this file is the entry point.
- *
- * Failures set `process.exitCode = 1` instead of calling `process.exit`, because an explicit exit can
- * truncate pending stderr writes. With nothing listening, the process ends on its own once stderr
- * is flushed.
- */
+/** Startup failures set `process.exitCode = 1`, not `process.exit`, which can truncate pending stderr. */
 function start() {
   const rawPort = process.env.PORT;
   const port = parsePort(rawPort);

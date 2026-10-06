@@ -149,7 +149,7 @@ function withCleanupDeadline(promise) {
  *
  * `closeAllConnections()` ends any keep-alive socket before the awaited `close()`, so shutdown never
  * waits on an idle connection. Sockets handed to the CONNECT listener are outside that call; they
- * close when the raw client ends its side, and in any case within the listener's own idle timeout.
+ * close once their response is flushed, and in any case within the listener's own idle timeout.
  *
  * @param {import('node:test').TestContext} t The running test, which owns the server.
  * @param {{ greet?: Function }} [options] Passed through to `createServer`.
@@ -298,7 +298,7 @@ function parseRawResponse(text) {
  * Writes `text` verbatim on a new `node:net` connection and collects everything the server sends
  * until it closes the connection, without interpreting it.
  *
- * When the server ends its side, this client ends its side too (the `net` default), so the server
+ * When the server ends its side, this client ends its side too (the `net` default), so its own
  * socket closes promptly. A 5-second idle timeout destroys a stalled connection and rejects, so a
  * connection the server leaves open fails the exchange rather than resolving. A cleanup step of
  * the test destroys the socket, which does nothing once it has closed, so a test that fails or
@@ -1287,7 +1287,6 @@ test('T13: an unexpected error returns 500, logs no request data, and the server
   assert.doesNotMatch(variantLogged, /zelda7f3k/i);
   assert.doesNotMatch(variantLogged, /\?name=/);
 
-  // The same server still serves a request on a new connection.
   assertText(
     await request(t, variantPort, { path: '/?name=Ada' }),
     200,
@@ -1297,7 +1296,6 @@ test('T13: an unexpected error returns 500, logs no request data, and the server
 });
 
 test('T14: PORT selects the listening port of the real entry point', LIFECYCLE_TEST, async (t) => {
-  // Each value runs on a port that is free at run time; none is fixed.
   const port = await findFreePort(t);
   await assertServesWithPort(t, String(port), port);
 
@@ -1363,6 +1361,56 @@ test('T17: CONNECT gets a raw 405 on / and 404 elsewhere, a raw 500 when answeri
   assert.strictEqual(elsewhere.headers.allow, undefined, 'CONNECT example.com:443');
   assert.strictEqual(elsewhere.headers['content-length'], '10', 'CONNECT example.com:443');
 
+  // A peer that withholds its end and keeps sending refreshes the listener's idle timeout forever,
+  // so the server itself must close a rejected CONNECT once its response is flushed.
+  const halfOpenExchange = (text) =>
+    new Promise((resolve, reject) => {
+      const deadlineMs = 2000;
+      const chunks = [];
+      let trickle = null;
+      const socket = net.connect({ port, host: HOST, allowHalfOpen: true }, () => {
+        socket.write(text);
+      });
+      onCleanup(t, () => {
+        socket.destroy();
+      });
+      const deadline = setTimeout(() => {
+        reject(
+          new Error(
+            `the server kept a half-open CONNECT socket open for ${deadlineMs} ms after its ` +
+              `response to ${JSON.stringify(text.split('\r\n')[0])}`,
+          ),
+        );
+        socket.destroy();
+      }, deadlineMs);
+      socket.on('data', (chunk) => chunks.push(chunk));
+      socket.on('end', () => {
+        trickle = setInterval(() => socket.write('x'), 50);
+      });
+      socket.on('error', (err) => {
+        // Once the trickle starts, EPIPE or ECONNRESET is how a server-side close shows up.
+        if (trickle === null) {
+          reject(err);
+        }
+      });
+      socket.on('close', () => {
+        clearTimeout(deadline);
+        clearInterval(trickle);
+        resolve(Buffer.concat(chunks).toString('utf8'));
+      });
+    });
+
+  const halfOpenRoot = parseRawResponse(
+    await halfOpenExchange('CONNECT / HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n'),
+  );
+  assertRawText(
+    halfOpenRoot,
+    'HTTP/1.1 405 Method Not Allowed',
+    METHOD_NOT_ALLOWED,
+    'half-open CONNECT /',
+  );
+  assert.strictEqual(halfOpenRoot.headers.allow, 'GET', 'half-open CONNECT /');
+
   // Force a failure before the response is committed: the listener reads the reason phrase for 405
   // from `http.STATUS_CODES` while building it. The original data property is restored straight
   // after the request, and again in `t.after` should the request itself fail.
@@ -1391,6 +1439,22 @@ test('T17: CONNECT gets a raw 405 on / and 404 elsewhere, a raw 500 when answeri
   assertRawText(failed, 'HTTP/1.1 500 Internal Server Error', SERVER_ERROR, 'failing CONNECT /');
   assert.strictEqual(failed.headers['content-length'], '21', 'failing CONNECT /');
   assert.strictEqual(log.mock.callCount(), 1);
+  assert.deepStrictEqual(callArguments(log), [[`${UNEXPECTED_ERROR_LOG} (stage: connect): Error`]]);
+
+  log.mock.resetCalls();
+  breakStatusLookup();
+  let halfOpenFailedText;
+  try {
+    halfOpenFailedText = await halfOpenExchange('CONNECT / HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n');
+  } finally {
+    restore();
+  }
+  assertRawText(
+    parseRawResponse(halfOpenFailedText),
+    'HTTP/1.1 500 Internal Server Error',
+    SERVER_ERROR,
+    'half-open failing CONNECT /',
+  );
   assert.deepStrictEqual(callArguments(log), [[`${UNEXPECTED_ERROR_LOG} (stage: connect): Error`]]);
 
   // From here every `end` on this server's accepted sockets throws. Client sockets keep the real
@@ -1432,7 +1496,7 @@ test('T17: CONNECT gets a raw 405 on / and 404 elsewhere, a raw 500 when answeri
     end.mock.restore();
   }
 
-  // With every override removed, CONNECT is answered normally again.
+  // With the response-writing overrides restored, CONNECT is answered normally again.
   const recovered = await rawRequest(t, port, 'CONNECT / HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n');
   assertRawText(
     recovered,
@@ -1442,7 +1506,6 @@ test('T17: CONNECT gets a raw 405 on / and 404 elsewhere, a raw 500 when answeri
   );
   assert.strictEqual(recovered.headers.allow, 'GET', 'CONNECT / after the failures');
 
-  // The same server keeps serving ordinary requests.
   assertText(await request(t, port, { path: '/' }), 200, HELLO_WORLD, 'GET / after CONNECT');
 });
 
