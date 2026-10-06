@@ -26,7 +26,7 @@
  * requiring it, as the tests do, only exposes `createServer` and `greet`.
  *
  * Statelessness: module scope holds only constants, frozen lookup tables and function declarations.
- * Nothing about a request, including the greeted name, is stored, written to disk or logged.
+ * No request data, including the greeted name, is stored, written to disk or logged.
  */
 
 const http = require('node:http');
