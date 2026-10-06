@@ -47,10 +47,13 @@ const METHOD_NOT_ALLOWED = 'Method not allowed.';
 const SERVER_ERROR = 'Something went wrong.';
 
 /**
- * Inactivity timeout armed on every client socket the helpers open: a connection that sends or
- * receives nothing for 5 seconds is destroyed and its exchange rejects, so a stall fails instead
- * of hanging. Traffic resets it, so it does not cap an exchange's total duration; the 10-second
- * per-test timeout bounds that instead.
+ * Inactivity timeout that `request`, `rawExchange` (and so `rawRequest`), `keepAliveExchange` and
+ * `keepAliveRequests` arm on each client socket they open: a connection that sends or receives
+ * nothing for 5 seconds is destroyed and its exchange rejects, so a stall fails instead of
+ * hanging. Traffic resets it, so it does not cap an exchange's total duration; the 10-second
+ * per-test timeout bounds that instead. The half-open CONNECT probe does not use it: its trickle
+ * of writes keeps the socket active, which would keep resetting this timeout, so that probe has
+ * its own 2-second absolute deadline.
  */
 const IO_TIMEOUT_MS = 5000;
 
@@ -368,10 +371,69 @@ function assertRawText(res, statusLine, body, label) {
 }
 
 /**
+ * Parses the response head that ends at byte `headEnd` of `bytes` into its status line, status
+ * code and lower-cased headers. Throws on a header line without a colon, and on a repeated
+ * `content-length`, because a response framed by that field would be ambiguous with two copies.
+ *
+ * @param {Buffer} bytes Received bytes that start with the head.
+ * @param {number} headEnd Index of the blank line that ends the head, which the head excludes.
+ * @returns {{ statusLine: string, status: number, headers: object }}
+ */
+function parseResponseHead(bytes, headEnd) {
+  const head = bytes.subarray(0, headEnd).toString('utf8');
+  const [statusLine, ...headerLines] = head.split('\r\n');
+  const headers = {};
+  for (const line of headerLines) {
+    const colon = line.indexOf(':');
+    if (colon === -1) {
+      throw new Error(`Malformed header line in raw response: ${JSON.stringify(line)}`);
+    }
+    const name = line.slice(0, colon).trim().toLowerCase();
+    if (name === 'content-length' && name in headers) {
+      throw new Error('Raw response repeats content-length');
+    }
+    headers[name] = line.slice(colon + 1).trim();
+  }
+  return { statusLine, status: Number(statusLine.split(' ')[1]), headers };
+}
+
+/**
+ * Takes one complete response from the start of `bytes`, framed in bytes by its single decimal
+ * `content-length`, so a client on a persistent connection can tell where a response ends without
+ * waiting for the server to close the connection.
+ *
+ * @param {Buffer} bytes Received bytes not yet assigned to a response.
+ * @returns {{
+ *   response: { statusLine: string, status: number, headers: object, body: string },
+ *   rest: Buffer,
+ * } | null} The response, with its body decoded as UTF-8, and the bytes received after it; `null`
+ *   while its head or the body that head declares has not fully arrived.
+ * @throws {Error} When `parseResponseHead` rejects the head, or its `content-length` is missing or
+ *   not a decimal number.
+ */
+function takeFramedResponse(bytes) {
+  const headEnd = bytes.indexOf('\r\n\r\n');
+  if (headEnd === -1) {
+    return null;
+  }
+  const head = parseResponseHead(bytes, headEnd);
+  const declared = head.headers['content-length'];
+  if (declared === undefined || !/^\d+$/.test(declared)) {
+    throw new Error(`Raw response has no usable content-length: ${JSON.stringify(declared)}`);
+  }
+  const bodyEnd = headEnd + 4 + Number(declared);
+  if (bytes.length < bodyEnd) {
+    return null;
+  }
+  const body = bytes.subarray(headEnd + 4, bodyEnd).toString('utf8');
+  return { response: { ...head, body }, rest: bytes.subarray(bodyEnd) };
+}
+
+/**
  * Writes two pieces of raw request text on one persistent `node:net` connection: `first` on
  * connect, and `second` only once a complete response to `first` has arrived. That response is
- * framed in bytes by its `content-length`; everything after it, until the server closes the
- * connection, is the second response.
+ * framed in bytes by its `content-length` (`takeFramedResponse`); everything after it, until the
+ * server closes the connection, is the second response.
  *
  * A POST must be answered while its body is still arriving, and the rest of that body must be
  * drained so the connection stays in step. `http.request` with `agent: false` asks the server to
@@ -408,26 +470,6 @@ function keepAliveExchange(t, port, first, second) {
     let received = Buffer.alloc(0);
     let firstResponse = null;
 
-    // Parses the head that ends at byte `headEnd` of `received`, which excludes the blank line.
-    function parseHead(headEnd) {
-      const head = received.subarray(0, headEnd).toString('utf8');
-      const [statusLine, ...headerLines] = head.split('\r\n');
-      const headers = {};
-      for (const line of headerLines) {
-        const colon = line.indexOf(':');
-        if (colon === -1) {
-          throw new Error(`Malformed header line in raw response: ${JSON.stringify(line)}`);
-        }
-        const name = line.slice(0, colon).trim().toLowerCase();
-        // The first response is framed by this field, so a second copy would make it ambiguous.
-        if (name === 'content-length' && name in headers) {
-          throw new Error('Raw response repeats content-length');
-        }
-        headers[name] = line.slice(colon + 1).trim();
-      }
-      return { statusLine, status: Number(statusLine.split(' ')[1]), headers };
-    }
-
     const socket = net.connect(port, HOST, () => socket.write(first));
     onCleanup(t, () => {
       socket.destroy();
@@ -441,29 +483,17 @@ function keepAliveExchange(t, port, first, second) {
       if (firstResponse !== null) {
         return;
       }
-      const headEnd = received.indexOf('\r\n\r\n');
-      if (headEnd === -1) {
-        return;
-      }
       try {
-        const head = parseHead(headEnd);
-        const declared = head.headers['content-length'];
-        if (declared === undefined || !/^\d+$/.test(declared)) {
-          throw new Error(
-            `First raw response has no usable content-length: ${JSON.stringify(declared)}`,
-          );
-        }
-        const bodyEnd = headEnd + 4 + Number(declared);
-        if (received.length < bodyEnd) {
+        const framed = takeFramedResponse(received);
+        if (framed === null) {
           return;
         }
-        const body = received.subarray(headEnd + 4, bodyEnd).toString('utf8');
-        firstResponse = { ...head, body };
-        received = received.subarray(bodyEnd);
+        firstResponse = framed.response;
+        received = framed.rest;
         // Sent only now, so `second` reaches the server strictly after the first response is out.
         socket.write(second);
       } catch (err) {
-        socket.destroy(err);
+        socket.destroy(new Error(`first response: ${err.message}`, { cause: err }));
       }
     });
     socket.on('error', reject);
@@ -486,7 +516,8 @@ function keepAliveExchange(t, port, first, second) {
       }
       try {
         const body = received.subarray(headEnd + 4).toString('utf8');
-        resolve({ first: firstResponse, second: { ...parseHead(headEnd), body } });
+        const secondResponse = { ...parseResponseHead(received, headEnd), body };
+        resolve({ first: firstResponse, second: secondResponse });
       } catch (err) {
         reject(err);
       }
@@ -717,79 +748,121 @@ function callArguments(mockFn) {
 }
 
 /**
- * Sends GET requests one after another over one persistent connection and collects each response
- * together with the socket that carried it.
+ * Sends GET requests one after another on one persistent raw `node:net` connection and collects
+ * each response.
  *
- * `request` gives every exchange its own connection, so it cannot show that a connection survives a
- * response. This helper owns a keep-alive agent limited to one socket and sends each request only
- * after the previous one has closed. For a kept-alive response that means its socket is back in the
- * agent's pool, so the next request reuses it; if the server closed or destroyed the connection,
- * the next request gets a new socket or fails. Each result records the carrying socket and
- * `reusedSocket`, so a test can assert continuity. The agent is destroyed by a cleanup step
- * registered before the first request, which closes the pooled socket, so nothing pooled outlives
- * the test. Each request also registers its own destroy, and the 5-second socket timeout fails a
- * stalled exchange instead of hanging.
+ * `request` keeps `agent: false`, so each of its exchanges gets its own connection that closes
+ * after the response and nothing pooled outlives a test; for the same reason it cannot show a
+ * connection surviving a response. A raw connection can. This helper writes the first request on
+ * connect and each later one only once the response before it has arrived in full, framed in
+ * bytes by its `content-length` (`takeFramedResponse`). A server can answer only requests it
+ * received on this connection, so resolving with one response per target proves that each
+ * response after the first rode the connection the one before it left open. Every request but
+ * the last carries no `Connection` header, so HTTP/1.1 keeps the connection open after it. The
+ * last carries `Connection: close`, so its response says `connection: close` and the server then
+ * closes the connection. The helper resolves only once the connection has closed, so nothing it
+ * opened outlives the exchange.
  *
- * @param {import('node:test').TestContext} t The running test, which owns the agent and its socket.
+ * The exchange rejects, naming the target concerned, when the connection ends or closes before
+ * every response is complete; when a response head has a header line without a colon or a
+ * missing, non-decimal or repeated `content-length`; and when bytes arrive beyond a response,
+ * because the server cannot have sent them in answer to a request not yet written. It also
+ * rejects on a transport error or a 5-second idle timeout. A cleanup step of the test destroys
+ * the socket, which does nothing once it has closed, so a test that fails or times out
+ * mid-exchange cannot leave it open.
+ *
+ * @param {import('node:test').TestContext} t The running test, which owns the connection.
  * @param {number} port Port to connect to on 127.0.0.1.
- * @param {string[]} targets Request targets, each sent as a GET, in order.
- * @returns {Promise<Array<{
- *   status: number,
- *   headers: object,
- *   body: string,
- *   socket: import('node:net').Socket,
- *   reusedSocket: boolean,
- * }>>} One result per target: what `request` returns, plus the socket that carried the response
- *   and whether the agent reused it from an earlier exchange.
+ * @param {string[]} targets Request targets, each sent as a GET, in order. There must be at least
+ *   one, and each must be visible ASCII, because a space or control character would break the
+ *   request line.
+ * @returns {Promise<Array<{ statusLine: string, status: number, headers: object, body: string }>>}
+ *   One response per target, in order, with lower-cased headers and the body decoded as UTF-8.
  */
-async function keepAliveRequests(t, port, targets) {
-  const agent = new http.Agent({ keepAlive: true, maxSockets: 1 });
-  onCleanup(t, () => {
-    agent.destroy();
-  });
-  const results = [];
-  for (const target of targets) {
-    const result = await new Promise((resolve, reject) => {
-      let response = null;
-      const req = http.request(
-        { host: HOST, port, path: target, agent, timeout: IO_TIMEOUT_MS },
-        (res) => {
-          // Read while the response is live: a kept-alive socket is detached from it once it ends.
-          const { socket } = res;
-          const chunks = [];
-          res.on('data', (chunk) => chunks.push(chunk));
-          res.on('error', reject);
-          res.on('end', () => {
-            response = {
-              status: res.statusCode,
-              headers: res.headers,
-              body: Buffer.concat(chunks).toString('utf8'),
-              socket,
-              reusedSocket: req.reusedSocket,
-            };
-          });
-        },
-      );
-      onCleanup(t, () => {
-        req.destroy();
-      });
-      req.on('timeout', () => req.destroy(new Error(`request for ${target} timed out`)));
-      req.on('error', reject);
-      // 'close' follows the response's 'end' once the socket is released, back to the pool or
-      // closed; earlier, it means the connection ended mid-exchange. After an error the promise is
-      // already rejected, and this later settle attempt is ignored.
-      req.on('close', () => {
-        if (response === null) {
-          reject(new Error(`connection closed before the response for ${target} ended`));
-        } else {
-          resolve(response);
-        }
-      });
-      req.end();
+function keepAliveRequests(t, port, targets) {
+  return new Promise((resolve, reject) => {
+    // A throw here rejects the promise before any connection is opened.
+    if (targets.length === 0) {
+      throw new Error('keepAliveRequests needs at least one request target');
+    }
+    for (const target of targets) {
+      if (!/^[\x21-\x7e]+$/.test(target)) {
+        throw new Error(`Request target must be visible ASCII: ${JSON.stringify(target)}`);
+      }
+    }
+    const lastIndex = targets.length - 1;
+    const requestText = (index) =>
+      `GET ${targets[index]} HTTP/1.1\r\nHost: ${HOST}\r\n` +
+      `${index === lastIndex ? 'Connection: close\r\n' : ''}\r\n`;
+    const responses = [];
+    // Bytes not yet assigned to a response.
+    let received = Buffer.alloc(0);
+
+    const socket = net.connect(port, HOST, () => socket.write(requestText(0)));
+    onCleanup(t, () => {
+      socket.destroy();
     });
-    results.push(result);
-  }
-  return results;
+    socket.setTimeout(IO_TIMEOUT_MS, () => {
+      const awaited =
+        responses.length < targets.length
+          ? `the response for ${targets[responses.length]}`
+          : `the server to close the connection after the response for ${targets[lastIndex]}`;
+      socket.destroy(new Error(`keep-alive requests timed out awaiting ${awaited}`));
+    });
+    socket.on('data', (chunk) => {
+      received = Buffer.concat([received, chunk]);
+      const index = responses.length;
+      if (index === targets.length) {
+        socket.destroy(
+          new Error(
+            `bytes arrived after the response for ${targets[lastIndex]}, the last one: ` +
+              JSON.stringify(received.toString('utf8')),
+          ),
+        );
+        return;
+      }
+      let framed;
+      try {
+        framed = takeFramedResponse(received);
+      } catch (err) {
+        socket.destroy(new Error(`response for ${targets[index]}: ${err.message}`, { cause: err }));
+        return;
+      }
+      if (framed === null) {
+        return;
+      }
+      // The next request is not written yet, so nothing after this response can answer it.
+      if (framed.rest.length > 0) {
+        socket.destroy(
+          new Error(
+            `bytes arrived beyond the response for ${targets[index]}: ` +
+              JSON.stringify(framed.rest.toString('utf8')),
+          ),
+        );
+        return;
+      }
+      responses.push(framed.response);
+      received = framed.rest;
+      if (index < lastIndex) {
+        // Written only now, so each request reaches the server strictly after the response before.
+        socket.write(requestText(index + 1));
+      }
+    });
+    socket.on('error', reject);
+    // After an error the promise is already rejected, and this later settle attempt is ignored.
+    socket.on('close', () => {
+      if (responses.length < targets.length) {
+        reject(
+          new Error(
+            `connection closed before the response for ${targets[responses.length]} was ` +
+              `complete: ${JSON.stringify(received.toString('utf8'))}`,
+          ),
+        );
+        return;
+      }
+      resolve(responses);
+    });
+  });
 }
 
 test('T1: GET / returns 200 Hello, world! as plain text with no trailing newline', IN_PROCESS_TEST, async (t) => {
@@ -1246,8 +1319,10 @@ test('T13: an unexpected error returns 500, logs no request data, and the server
     );
   }
 
-  // Every variant and two greetings, on one keep-alive connection: a 500 that could be written
-  // leaves the connection open for the next request.
+  // Every variant and two greetings, on one raw keep-alive connection: a 500 that could be written
+  // leaves the connection open for the next request. `keepAliveRequests` writes each request only
+  // once the response before it is complete, and resolves only when every request was answered on
+  // that one connection, so each response proves the one before it kept the connection open.
   log.mock.resetCalls();
   const variantPort = await startServer(t, { greet: variantGreet });
   const failing = ({ name }) => ({ target: `/?name=${name}`, status: 500, body: SERVER_ERROR });
@@ -1259,20 +1334,22 @@ test('T13: an unexpected error returns 500, logs no request data, and the server
     exchanges.map(({ target }) => target),
   );
 
-  assert.strictEqual(responses.length, exchanges.length);
-  assert.strictEqual(responses[0].reusedSocket, false, 'the first request opens the connection');
+  assert.strictEqual(
+    responses.length,
+    exchanges.length,
+    'one response per request, one connection',
+  );
   for (const [index, { target, status, body }] of exchanges.entries()) {
     const res = responses[index];
     const label = `keep-alive GET ${target} (#${index + 1})`;
     assertText(res, status, body, label);
     if (status === 500) {
       assert.strictEqual(res.headers['content-length'], '21', label);
-      assert.strictEqual(res.headers.connection, 'keep-alive', `${label}: connection`);
     }
-    if (index > 0) {
-      assert.strictEqual(res.socket, responses[0].socket, `${label}: same connection`);
-      assert.strictEqual(res.reusedSocket, true, `${label}: reused connection`);
-    }
+    // Every response with a successor, each 500 included, offers to keep the connection; the last
+    // request asked the server to close it.
+    const connection = index < exchanges.length - 1 ? 'keep-alive' : 'close';
+    assert.strictEqual(res.headers.connection, connection, `${label}: connection`);
   }
 
   // One single-string diagnostic per 500, in order, each holding only the literal label.
@@ -1635,13 +1712,17 @@ test('T20: an unreadable error and a failing console still produce the 500, and 
   assert.strictEqual(log.mock.calls[1].error.message, 'console failed');
 
   // The 500 for an unreadable error leaves a keep-alive connection open for the next request too.
-  const [failed, after] = await keepAliveRequests(t, port, ['/', '/about']);
+  // `keepAliveRequests` writes GET /about on the raw connection that carried the 500, only once
+  // the 500 is complete, so the 404 that answers it rode the connection the 500 left open.
+  const responses = await keepAliveRequests(t, port, ['/', '/about']);
+  assert.strictEqual(responses.length, 2, 'one response per request, one connection');
+  const [failed, after] = responses;
   assertText(failed, 500, SERVER_ERROR, 'keep-alive unreadable error');
   assert.strictEqual(failed.headers['content-length'], '21', 'keep-alive unreadable error');
   assert.strictEqual(failed.headers.connection, 'keep-alive', 'keep-alive unreadable error');
   assertText(after, 404, NOT_FOUND, 'keep-alive GET /about after the 500');
-  assert.strictEqual(after.socket, failed.socket, 'GET /about rides the connection of the 500');
-  assert.strictEqual(after.reusedSocket, true, 'GET /about reuses the connection of the 500');
+  // The last request asked the server to close the connection, which ended the exchange.
+  assert.strictEqual(after.headers.connection, 'close', 'keep-alive GET /about after the 500');
 
   // That 500 adds exactly one diagnostic, and the console no longer throws.
   assert.strictEqual(log.mock.callCount(), 3);
