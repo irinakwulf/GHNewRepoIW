@@ -53,7 +53,7 @@ const SERVER_ERROR = 'Something went wrong.';
  * so a stall fails instead of hanging. Traffic resets it, so it does not cap an exchange's total
  * duration; the 10-second per-test timeout bounds that instead. Once the half-open probe ends its
  * side, it also gives the server 2 seconds to close the connection, well inside the listener's
- * 5-second idle timeout, so only the probe's end can account for that close.
+ * 5-second lifetime limit, so only the probe's end can account for that close.
  */
 const IO_TIMEOUT_MS = 5000;
 
@@ -64,7 +64,7 @@ const IN_PROCESS_TEST = Object.freeze({ timeout: 10000 });
 
 /**
  * Deadline for each cleanup step. A test's timeout does not cover its `t.after` hook, and a
- * server's `close()` may wait out the service's 5-second CONNECT idle timeout, so the bound is
+ * server's `close()` may wait out the service's 5-second CONNECT lifetime limit, so the bound is
  * longer than that.
  */
 const CLEANUP_TIMEOUT_MS = 10000;
@@ -153,7 +153,7 @@ function withCleanupDeadline(promise) {
  * `closeAllConnections()` ends any keep-alive socket before the awaited `close()`, so shutdown never
  * waits on an idle connection. Sockets handed to the CONNECT listener are outside that call; they
  * close when the client ends its side after the server's `end()`, and in any case within the
- * listener's 5-second idle timeout.
+ * listener's 5-second lifetime limit.
  *
  * @param {import('node:test').TestContext} t The running test, which owns the server.
  * @param {{ greet?: Function }} [options] Passed through to `createServer`.
@@ -1443,7 +1443,7 @@ test('T17: CONNECT gets a raw 405 on / and 404 elsewhere, a raw 500 when answeri
 
   // After its response the listener ends only its own side and keeps discarding input, so a client
   // may go on sending without being reset, and the client's own end, not the listener's 5-second
-  // idle timeout, closes the connection. A client's `close` after its own `end` is local, so the
+  // lifetime limit, closes the connection. A client's `close` after its own `end` is local, so the
   // probe watches the server's socket, found through the `end` call that writes the response.
   const halfOpenExchange = (text) =>
     new Promise((resolve, reject) => {

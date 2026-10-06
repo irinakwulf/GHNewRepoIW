@@ -39,7 +39,7 @@ const DEFAULT_PORT = 3000;
 
 const CONTENT_TYPE = 'text/plain; charset=utf-8';
 
-/** Idle lifetime of a socket handed to the CONNECT listener, which Node's request timeouts no longer cover. */
+/** Longest a socket may live once handed to the CONNECT listener; Node's request timeouts no longer cover it. */
 const CONNECT_SOCKET_TIMEOUT_MS = 5000;
 
 /** The fixed response bodies. Each has no trailing newline, so `curl` prints exactly this text. */
@@ -197,7 +197,13 @@ function rejectConnect(req, socket) {
   let committed = false;
   try {
     socket.on('error', () => socket.destroy());
-    socket.setTimeout(CONNECT_SOCKET_TIMEOUT_MS, () => socket.destroy());
+    // A fixed limit from hand-off, not `socket.setTimeout`: that idle timer restarts on every byte
+    // read, so a client trickling input could hold the socket open indefinitely. This one bounds it
+    // whatever the client sends, and still destroys an idle socket at 5 seconds.
+    const lifetime = setTimeout(() => socket.destroy(), CONNECT_SOCKET_TIMEOUT_MS);
+    // Unref'd so the timer alone never keeps the process alive; an open socket already does.
+    lifetime.unref();
+    socket.once('close', () => clearTimeout(lifetime));
     // Discard anything the client sends after the request head.
     socket.resume();
 
@@ -208,7 +214,8 @@ function rejectConnect(req, socket) {
         : rawResponse(404, MESSAGES.notFound);
 
     committed = true;
-    // Half-close only; the peer's FIN or idle timeout closes it, as a destroy with input unread sends RST.
+    // Half-close only; the peer's FIN or the 5-second lifetime limit closes it, as a destroy with
+    // input unread sends RST.
     socket.end(response);
   } catch (err) {
     logSafely(`Unexpected error while handling a request (stage: connect): ${describeError(err)}`);
