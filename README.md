@@ -126,7 +126,8 @@ only. The start-up tests run the real server, which listens on every network int
 `npm start` does, and the port-in-use test holds its port on every interface in the same way.
 
 A passing run ends with a summary reporting `tests 20`, `pass 20` and `fail 0`, and the exit status
-is 0. Each summary line starts with `ℹ` in a terminal, or `#` when the output is piped or redirected.
+is 0. On Node.js 20 and 22, each summary line starts with `ℹ` in a terminal, or `#` when the output
+is piped or redirected. From Node.js 23 on, it starts with `ℹ` in both cases.
 Check the exit status straight after the run:
 
 macOS and Linux (bash, zsh):
