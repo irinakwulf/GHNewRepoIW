@@ -20,7 +20,10 @@ an exit status alone is never taken as proof of what a method printed.
 Run from the repository root (``-s tests`` is required because ``tests/`` is
 not a package)::
 
-    python -B -m unittest discover -s tests -v --buffer
+    "$PY" -B -m unittest discover -s tests -v --buffer
+
+``$PY`` is the project's isolated CPython 3.12.3 interpreter, never a
+``python`` or ``python3`` found on ``PATH``.
 """
 
 import contextlib
@@ -35,7 +38,7 @@ from unittest import mock
 
 # The repository root is the parent of ``tests/``. Putting it first on
 # ``sys.path`` lets the first-party import below resolve whatever the current
-# working directory is, and gives child interpreters a fixed ``cwd``.
+# working directory is.
 REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, REPO_ROOT)
 
