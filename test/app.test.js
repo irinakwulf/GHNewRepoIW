@@ -19,8 +19,8 @@
  * Only Node built-ins are used, and only APIs present in Node 18.1.0, the
  * earliest release with `node --test`. That is why the suite has one parent
  * `test` with `t.test` subtests instead of before/after hooks (added in
- * 18.8.0), and tracks sockets itself instead of using the http.Server method
- * that closes every connection (added in 18.2.0).
+ * 18.8.0), and tracks sockets itself instead of the http.Server method
+ * `server.closeAllConnections` (added in 18.2.0).
  */
 
 // `test`: the `node:test` module export, a function that registers the parent test.
