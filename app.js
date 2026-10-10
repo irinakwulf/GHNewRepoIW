@@ -13,16 +13,10 @@
  * answered automatically, and query strings do not affect route matching.
  */
 
-// `express`: the `express` module export, a function that creates an application.
 const express = require('express');
 
-// `app`: the Express application holding the two routes; exported for
-// `server.js` and the tests.
 const app = express();
 
-// Route handler parameters, used by both routes:
-//   `req`: the Express request; unused, kept for Express's handler signature.
-//   `res`: the Express response; sets the Content-Type and sends the body.
 // `res.type('text/plain')` is explicit because sending a bare string answers
 // text/html; Express appends `; charset=utf-8` when it writes the header.
 
