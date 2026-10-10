@@ -23,10 +23,8 @@
  *                 error take this same path.
  */
 
-// `app`: the Express application exported by `app.js`; it holds the routes.
 const app = require('./app');
 
-// `DEFAULT_PORT`: the port used when `PORT` is unset or empty.
 const DEFAULT_PORT = 3000;
 
 // `MIN_PORT`, `MAX_PORT`: inclusive bounds of a valid port; also quoted in
@@ -55,7 +53,6 @@ function resolvePort(value) {
   if (!/^[0-9]+$/.test(value)) {
     return null;
   }
-  // `parsed`: the numeric candidate compared with MIN_PORT and MAX_PORT.
   // Converted only after the digits check, so forms Number() would accept,
   // such as '1e3' or '0x10', never reach the range check.
   const parsed = Number(value);
@@ -85,9 +82,6 @@ if (port === null) {
   // http://localhost:<port> reaches it. Express 5 calls the callback exactly
   // once: with no argument after a successful bind, or with the error the
   // server emitted.
-  //   `error`: the bind failure (EADDRINUSE, EACCES or any other listen
-  //   error), or undefined on success. Every failure is handled alike: it is
-  //   logged and the process exits with status 1.
   app.listen(port, (error) => {
     if (error) {
       console.error(`Cannot listen on port ${port}: ${error.message}`);

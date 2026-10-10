@@ -23,16 +23,13 @@
  * `server.closeAllConnections` (added in 18.2.0).
  */
 
-// `test`: the `node:test` module export, a function that registers the parent test.
 const test = require('node:test');
 
 // `assert`: the `node:assert/strict` module; `assert.equal` is strict equality.
 const assert = require('node:assert/strict');
 
-// `app`: the Express application under test, exported by `app.js`.
 const app = require('../app');
 
-// `TEXT_PLAIN_UTF8`: the expected Content-Type of both 200 responses.
 const TEXT_PLAIN_UTF8 = 'text/plain; charset=utf-8';
 
 /**
@@ -45,15 +42,10 @@ const TEXT_PLAIN_UTF8 = 'text/plain; charset=utf-8';
  *   Resolves once the server is listening; rejects with the bind error.
  */
 function startServer() {
-  // `resolve`, `reject`: settle the start promise.
   return new Promise((resolve, reject) => {
-    // `sockets`: Set of net.Socket, the open connections to destroy at teardown.
     const sockets = new Set();
 
-    // `server`: the http.Server test handle. Express 5 calls the listen
-    // callback exactly once, after the bind succeeds or fails.
     const server = app.listen(0, '127.0.0.1', (error) => {
-      // `error`: the bind failure, which rejects startServer; undefined on success.
       if (error) {
         reject(error);
         return;
@@ -61,7 +53,6 @@ function startServer() {
       resolve({ server, sockets });
     });
 
-    // `socket`: a net.Socket connection, tracked from connect until it closes.
     server.on('connection', (socket) => {
       sockets.add(socket);
       socket.on('close', () => {
@@ -85,22 +76,17 @@ function startServer() {
  * @returns {Promise<void>} Resolves once the server has closed.
  */
 function stopServer({ server, sockets }) {
-  // `resolve`: settles the stop promise once the server has closed.
   return new Promise((resolve) => {
     server.close(resolve);
-    // `socket`: each tracked connection, destroyed so that close completes at once.
     for (const socket of sockets) {
       socket.destroy();
     }
   });
 }
 
-// `t`: the parent test's context, which runs the five subtests through `t.test`.
 test('HTTP endpoints', async (t) => {
-  // `running`: the { server, sockets } handle, passed to stopServer in `finally`.
   const running = await startServer();
 
-  // `baseUrl`: `http://127.0.0.1:<ephemeral port>`, the prefix of every request.
   const baseUrl = `http://127.0.0.1:${running.server.address().port}`;
 
   /**
@@ -112,7 +98,6 @@ test('HTTP endpoints', async (t) => {
    * @returns {Promise<void>} Resolves when every assertion has passed.
    */
   async function assertTextResponse(path, expectedBody) {
-    // `response`: the fetch Response being asserted.
     const response = await fetch(`${baseUrl}${path}`);
     assert.equal(response.status, 200);
     assert.equal(response.headers.get('content-type'), TEXT_PLAIN_UTF8);
@@ -133,13 +118,11 @@ test('HTTP endpoints', async (t) => {
     });
 
     await t.test('GET /no-such-path returns 404', async () => {
-      // `response`: the fetch Response being asserted.
       const response = await fetch(`${baseUrl}/no-such-path`);
       assert.equal(response.status, 404);
     });
 
     await t.test('POST /good-evening returns 404', async () => {
-      // `response`: the fetch Response being asserted.
       const response = await fetch(`${baseUrl}/good-evening`, { method: 'POST' });
       assert.equal(response.status, 404);
     });
