@@ -104,7 +104,13 @@ if (port === null) {
   console.error(
     `Invalid PORT ${escapePortValue(rawPort)}: expected a whole number from ${MIN_PORT} to ${MAX_PORT}`
   );
-  process.exit(1);
+  // The status is set rather than forced so that the diagnostic above drains
+  // instead of being cut at the 64 KiB pipe buffer: standard error is written
+  // asynchronously when it is a pipe, and process.exit(1) would abandon the
+  // write in progress after one buffer, losing the rest of the line and its
+  // line feed. No socket is opened on this path, so nothing keeps the process
+  // alive and it ends on its own with status 1.
+  process.exitCode = 1;
 } else {
   // No host argument: the server binds all interfaces, so
   // http://localhost:<port> reaches it. Express 5 calls the callback exactly
