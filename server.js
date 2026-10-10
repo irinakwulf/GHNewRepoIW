@@ -17,7 +17,9 @@
  * Outcomes:
  *   bound         stdout `Listening on port <port>`; the server keeps running.
  *   invalid PORT  stderr `Invalid PORT "<PORT>": expected a whole number from
- *                 1 to 65535`; exit status 1; app.listen is never called.
+ *                 1 to 65535`, with the value escaped by escapePortValue so
+ *                 that one invalid value is always one line; exit status 1;
+ *                 app.listen is never called.
  *   bind failure  stderr `Cannot listen on port <port>: <error message>`;
  *                 exit status 1. EADDRINUSE, EACCES and every other listen
  *                 error take this same path.
@@ -62,8 +64,34 @@ function resolvePort(value) {
   return parsed;
 }
 
+/**
+ * Renders a raw `PORT` value for the invalid-PORT diagnostic.
+ *
+ * The value is interpolated into that message, so it is escaped instead of
+ * echoed verbatim: a value carrying a line break would otherwise end the
+ * diagnostic early and forge the `Listening on port <port>` line the process
+ * writes to standard output after a successful bind, defeating log-based
+ * liveness checks (CWE-117 log injection). JSON.stringify supplies the
+ * standard escapes for the C0 range, so a line feed becomes the two
+ * characters `\n`, and also for `"` and `\`, which marks where the echoed value
+ * ends. It leaves the C1 range, DEL (U+007F to U+009F) and the Unicode line and
+ * paragraph separators (U+2028, U+2029) raw, so those are escaped as `\uXXXX`:
+ * a log reader or terminal may still break a line at any of them. No character
+ * is dropped, so the diagnostic keeps reporting whatever was passed.
+ *
+ * @param {string} value Raw `PORT` value, exactly as read from the environment.
+ * @returns {string} That value as a quoted literal, single-line and free of
+ *   control characters, ready to interpolate into a log line.
+ */
+function escapePortValue(value) {
+  return JSON.stringify(value).replace(
+    /[\u007F-\u009F\u2028\u2029]/g,
+    (character) => `\\u${character.codePointAt(0).toString(16).padStart(4, '0')}`
+  );
+}
+
 // `rawPort`: `PORT` exactly as given, a string or undefined when unset; read
-// once and echoed in the invalid-PORT message.
+// once and rendered by escapePortValue in the invalid-PORT message.
 const rawPort = process.env.PORT;
 
 // `port`: the resolved port number, or null when `rawPort` is invalid (null
@@ -74,7 +102,7 @@ const port = resolvePort(rawPort);
 
 if (port === null) {
   console.error(
-    `Invalid PORT "${rawPort}": expected a whole number from ${MIN_PORT} to ${MAX_PORT}`
+    `Invalid PORT ${escapePortValue(rawPort)}: expected a whole number from ${MIN_PORT} to ${MAX_PORT}`
   );
   process.exit(1);
 } else {
