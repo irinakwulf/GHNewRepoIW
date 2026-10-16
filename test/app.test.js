@@ -34,11 +34,13 @@
  * `server.closeAllConnections` (added in 18.2.0).
  */
 
+// `test`: the `node:test` registration function that declares the parent test.
 const test = require('node:test');
 
 // `assert`: the `node:assert/strict` module; `assert.equal` is strict equality.
 const assert = require('node:assert/strict');
 
+// `app`: the Express application under test, from `../app`.
 const app = require('../app');
 
 // `TEST_SERVER_PORT`: port `0`, so the operating system picks a free port for
@@ -49,6 +51,7 @@ const TEST_SERVER_PORT = 0;
 // external interfaces.
 const TEST_SERVER_HOST = '127.0.0.1';
 
+// `TEXT_PLAIN_UTF8`: the Content-Type both 200 responses must carry.
 const TEXT_PLAIN_UTF8 = 'text/plain; charset=utf-8';
 
 // `HTTP_OK`: the status the three 200 cases expect.
@@ -69,10 +72,6 @@ const REQUEST_TIMEOUT_MS = 5000;
 
 /**
  * Starts `app` on an ephemeral loopback port and tracks its open connections.
- *
- * `TEST_SERVER_PORT` is `0`, so the operating system picks a free port, and
- * `TEST_SERVER_HOST` is the loopback address, which keeps the test server off
- * external interfaces.
  *
  * A bind failure reaches the listen callback as `error`. The server is closed
  * and every tracked socket destroyed before the promise rejects, so a failed
