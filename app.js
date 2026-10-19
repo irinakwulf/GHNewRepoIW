@@ -18,8 +18,7 @@
 const express = require('express');
 
 // `app`: the application holding the two routes below, exported at the end of
-// this module. It never binds a port: `server.js` starts it on the configured
-// port and `test/app.test.js` starts it on an ephemeral one.
+// this module.
 const app = express();
 
 // `res.type('text/plain')` is explicit because sending a bare string answers
