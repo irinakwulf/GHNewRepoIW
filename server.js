@@ -119,6 +119,9 @@ if (port === null) {
   app.listen(port, (error) => {
     if (error) {
       console.error(`Cannot listen on port ${port}: ${error.message}`);
+      // Same drain-safe exit as the invalid-PORT branch above: the failed
+      // bind leaves no listener open, so nothing keeps the process alive and
+      // it ends on its own with status 1.
       process.exitCode = 1;
     } else {
       console.log(`Listening on port ${port}`);
