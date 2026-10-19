@@ -119,7 +119,7 @@ if (port === null) {
   app.listen(port, (error) => {
     if (error) {
       console.error(`Cannot listen on port ${port}: ${error.message}`);
-      process.exit(1);
+      process.exitCode = 1;
     } else {
       console.log(`Listening on port ${port}`);
     }
